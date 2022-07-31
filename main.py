@@ -1,6 +1,6 @@
-import sys, torch, os, json, configparser, argparse, datetime
+import sys, torch, os, json, configparser, argparse, datetime, logging
 from tqdm import tqdm
-from process_data import DuolingoDatasetBuilder, DuolingoDataset, DuolingoTokenizer
+from process_data import DuolingoDatasetBuilder, DuolingoDataset, DuolingoKTDataset
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from models import SAKT
@@ -20,19 +20,6 @@ assistment_dir = '/cluster/work/sachan/pencui/ASSISTment'
 duolingo_raw_en_es_dir = "/cluster/work/sachan/pencui/duolingo_2018_shared_task/data_en_es" # '/Users/cuipeng/Documents/Datasets/duolingo_2018_shared_task/data_en_es'
 duolingo_processed_en_es_dir = "/cluster/project/sachan/pencui/duolingo/data_en_es/"
 duolingo_en_es_models_dir = '/cluster/work/sachan/pencui/duolingo_2018_shared_task/data_en_es/models'
-
-file_paths = {
-    "Assistment_2004_2005": 'ASSISTment_2004_2005/ds92_tx_All_Data_172_2016_0504_081852.txt',
-    "Assistment_2005_2006": 'ASSISTment_2005_2006/ds120_tx_All_Data_265_2017_0414_065125.txt',
-    "Assistment_2006_2007": 'ASSISTment_2006_2007/ds339_tx_All_Data_1059_2015_0729_215742.txt',
-    "Duolingo_en_es_train": "en_es.slam.20190204.train",
-    "Duolingo_en_es_test": "en_es.slam.20190204.test",
-    "Duolingo_en_es_dev": "en_es.slam.20190204.dev",
-    "Duolingo_en_es_test_key": "en_es.slam.20190204.test.key",
-    "Duolingo_en_es_dev_key": "en_es.slam.20190204.dev.key",
-    "Duolingo_en_es_train_processed": "train_processed_1024",
-    "vocab": "vocab.txt"
-}
 
 
 def cal_metrics(logits, y_labels):
@@ -72,7 +59,6 @@ def train(args):
     # dataset_builder.save_by_stu(os.path.join(duolingo_en_es_dir, file_paths['Duolingo_en_es_train_processed']))
     # exit(1)
     dataset = DuolingoDataset(os.path.join(duolingo_processed_en_es_dir, file_paths['Duolingo_en_es_train_processed']), shuffle=True)
-    tokenizer = DuolingoTokenizer(args.vocab_save_path)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, drop_last=True)
 
     model = SAKT(
@@ -153,57 +139,60 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-
-    # model parameters
-    parser.add_argument('--num_emb', type=int)
-    parser.add_argument('--dim_emb', type=int, default=256)
-    parser.add_argument('--max_len', type=int, default=1024)
-    parser.add_argument('--dim_pe', type=int, default=256)
-
-    parser.add_argument('--dim_attn_exercise', type=int, default=256)
-    parser.add_argument('--num_attn_heads_exercise', type=int, default=4)
-    parser.add_argument('--dim_ff_exercise', type=int, default=256)
-    parser.add_argument('--dropout_exercise', type=float, default=0.1)
-    parser.add_argument('--num_exercise_encoder_layers', type=int, default=3)
-
-    parser.add_argument('--dim_attn_interaction', type=int, default=256)
-    parser.add_argument('--num_attn_heads_interaction', type=int, default=4)
-    parser.add_argument('--dim_ff_interaction', type=int, default=256)
-    parser.add_argument('--dropout_interaction', type=float, default=0.1)
-    parser.add_argument('--num_interaction_encoder_layers', type=int, default=3)
-    parser.add_argument('--num_label', type=int, default=2)
-
-    # training setup
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epoch', type=int, default=200)
-    parser.add_argument('--run', type=str, default='train') # train, val, test
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
-    parser.add_argument('--warmup_rate', type=float, default=0.03)
-    parser.add_argument('--ignore_label', type=int, default=-1)
+    parser.add_argument('--conf', type=str, default='local_conf.ini')
     
-    # paths
-    parser.add_argument('--raw_data_dir', type=str, default=duolingo_raw_en_es_dir)
-    parser.add_argument('--processed_data_dir', type=str, default=duolingo_processed_en_es_dir)
-    parser.add_argument('--data_file', type=str, default=file_paths['Duolingo_en_es_train'])
-    parser.add_argument('--vocab_save_path', type=str, default=os.path.join(duolingo_processed_en_es_dir, file_paths['vocab']))
-    parser.add_argument('--model_save_dir', type=str, default=duolingo_en_es_models_dir)
+    args, remaining_argv = parser.parse_known_args()
+    config = configparser.ConfigParser()
+    config.read(args.conf)
+
+    for section in config:
+        if section == 'DEFAULT':
+            continue
+        for option in config.options(section):
+            parser.add_argument('--{}'.format(option), default=config.get(section, option))
     
+    args = parser.parse_args(remaining_argv)
     
-    args = parser.parse_args()
+    logging.basicConfig(
+        format='%(asctime)s %(message)s', 
+        datefmt='%Y-%d-%m %I:%M:%S %p', 
+        filename=args.duolingo_en_es_train_log, 
+        level=logging.INFO, 
+        filemode='w'
+    )
 
-    if args.run == 'train':
-        train(args)
-    elif args.run == 'test':
-        test(args)
-    elif args.run == 'val':
-        val(args)
+    # if args.run == 'train':
+    #     train(args)
+    # elif args.run == 'test':
+    #     test(args)
+    # elif args.run == 'val':
+    #     val(args)
 
-    # a = torch.tensor([1, 0, 1])
-    # b = torch.tensor([0, 0, -1])
-    # correct_cnt = torch.sum(torch.eq(b-a, 0))
-    # valid_cnt = a.size(0) - torch.eq(b, -1).sum()
-    # print(correct_cnt)
-    # print(valid_cnt)
+    DuolingoKTDataset.get_format_datat(
+        train_raw=args.duolingo_en_es_train_raw, 
+        dev_raw=args.duolingo_en_es_dev_raw, 
+        dev_key_raw=args.duolingo_en_es_dev_key_raw, 
+        test_raw=args.duolingo_en_es_test_raw, 
+        test_key_raw=args.duolingo_en_es_test_key_raw, 
+        format_output=args.duolingo_en_es_format, 
+        vocab_file=args.duolingo_en_es_vocab, 
+        word_file=args.duolingo_en_es_words, 
+        exercise_file=args.duolingo_en_es_exercises
+    )
 
-    # x = [i%2 for i in range(2000000)]
-    # print(sys.getsizeof(x))
+    # duolingo_kt_dataset = DuolingoKTDataset(
+    #     data_file=args.duolingo_en_es_format, 
+    #     vocab_file=args.duolingo_en_es_vocab, 
+    #     word_file=args.duolingo_en_es_words, 
+    #     exercise_file=args.duolingo_en_es_exercises,
+    #     max_len=args.max_len
+    # )
+
+    # for split in [None, 0, 1, 2]:
+    #     print('='*100)
+    #     stat = duolingo_kt_dataset.get_statistics(split=split)
+    #     for key in stat:
+    #         print(key, stat[key])
+
+
+    
