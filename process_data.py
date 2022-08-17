@@ -1,9 +1,10 @@
-import sys, os, re, json, random, torch, argparse, configparser, logging, csv
+import sys, os, re, json, random, torch, argparse, configparser, logging, csv, math
 from torch.utils.data import Dataset
 from typing import List, Dict
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+from transformers import BartTokenizer
 
         
 class DuolingoDatasetBuilder(Dataset):
@@ -174,6 +175,10 @@ class DuolingoDatasetBuilder(Dataset):
         with open(save_path, 'w') as fp:
             for token in self.vocab:
                 fp.write('{}\t{}\t{}\n'.format(token, self.vocab[token][0], self.vocab[token][1])) 
+
+
+def compute_difficulty(exercise_words, error_cnt):
+    return error_cnt / math.sqrt(len(exercise_words))
 
 
 class DuolingoKTDataset(Dataset):
@@ -601,6 +606,7 @@ class DuolingoDataset(Dataset):
                 np.array(example_json['y_labels'])
             )
 
+
 class DuolingoTokenizer:
     def __init__(self, vocab_save_path):
         self.vocab = {}
@@ -641,27 +647,136 @@ class DuolingoTokenizer:
 
 
 class DuolingoGenDataset(Dataset):
-    def __init__(self, data_file):
-        with open(data_file, 'r') as fp:
+    def __init__(self, data_file, split, word_file, sample_rate):
+        assert split in ['train', 'dev', 'test']
+        self.sample_priority = [
+            ['NOUN', 'VERB'],
+            ['ADJ', 'ADV'],
+            # ['PUNCT', 'SYM', 'X', 'ADP', 'AUX', 'INTJ', 'CCONJ', 'DET'. 'PROPN', 'NUM', 'PART', 'SCONJ', 'PRON']
+        ]
+        self.vocab = {}
+
+        self.user_ids = []
+        self.difficulty = []
+        self.x_keywords = []
+        self.y_exercises = []
+
+        df = pd.read_csv(word_file)
+        for index, row in df.iterrows():
+            self.vocab[row['word']] = len(self.vocab)
             
-        pass
+        with open(data_file, 'r') as fp:
+            for line in fp.readlines():
+                user_log = json.loads(line.strip())
+                for interaction_log in user_log[split]:
+                    keywords = self.sample_by_pos(interaction_log['exercise'])
+                    exercise_words = [item['text'] for item in interaction_log['exercise']]
+                    error_cnt = sum([item['label'] for item in interaction_log['exercise']])
+                    if keywords:
+                        self.user_ids.append(user_log['user'])
+                        self.difficulty.append(error_cnt/math.sqrt(len(interaction_log['exercise'])))
+                        self.x_keywords.append(' '.join(keywords))
+                        self.y_exercises.append(' '.join(exercise_words))
+                        
 
     def __getitem__(self, index):
-        pass
+        return self.user_ids[index], self.difficulty[index], self.x_keywords[index], self.y_exercises[index]
 
     def __len__(self):
-        return len(self.data_x)
+        return len(self.x_keywords)
+
+    def sample_by_pos(self, exercise, rate=0.5):
+        # hierarchical sample
+        if len(exercise) == 1:
+            return None
+        
+        total_num = math.ceil(len(exercise)*rate)
+        sampled = []
+
+        # seperate words
+        source_lists = [[] for i in range(len(self.sample_priority)+1)]
+        for item in exercise:
+            if item['text'] in ['am', 'is', 'are']:
+                source_lists[-1].append(item['text'])
+                continue
+            flag = False
+            for i, pos_list in enumerate(self.sample_priority):
+                if item['pos'] in pos_list:
+                    source_lists[i].append(item['text'])
+                    flag = True
+                    break
+            if not flag:
+                source_lists[-1].append(item['text'])
+
+        sampled = set([])
+        for source in source_lists:
+            sampled.update(random.sample(source, min(max(total_num-len(sampled), 0), len(source))))
+            if len(sampled) >= total_num:
+                break
+        
+        sampled = list(sampled)
+        random.shuffle(sampled)
+
+        return sampled
+    
+    def sample_by_difficulty(self, exercise):
+        pass
+
+    
+    def sample_random(self, exercise):
+        pass
+
+    def calc_word_coverage(self):
+        # word coverage of sample strategy
+        covered = set()
+        for keywords in self.x_keywords:
+            for word in keywords:
+                covered.add(word)
+        
+        return len(covered) / len(self.vocab)  
 
 
-def write(a, b=1):
-    print(a)
-    print(b)
 
+class QGDataCollator:
+    def __init__(self, model, tokenizer, x_max_length, y_max_length, padding='max_length', truncation='pt', label_pad_token_id=-100, return_tensors=True):
+        self.model = model
+        self.padding = padding
+        self.x_max_length = x_max_length
+        self.y_max_length = y_max_length
+        self.label_pad_token_id = label_pad_token_id
+        self.return_tensors = return_tensors
+        self.truncation = truncation
+        self.tokenizer = tokenizer
 
+    def __call__(self, batch_data):
 
-def caller(func):
-    print('running {}'.format(func.__name__))
-    func(1)
+        user_ids = [data[0] for data in batch_data]
+        
+        difficulties = [data[1] for data in batch_data]
+        
+        keywords_encoded = self.tokenizer(
+            [data[2] for data in batch_data], 
+            max_length=self.x_max_length, 
+            padding=self.padding,
+            truncation=self.truncation,
+            return_tensors=self.return_tensors
+        )
+        x_keyword_ids = keywords_encoded['input_ids']
+        x_attention_mask = keywords_encoded['attention_mask']
+
+        y_exercise_labels = self.tokenizer(
+            [data[3] for data in batch_data],
+            max_length=self.y_max_length,
+            padding=self.padding,
+            truncation=self.truncation,
+            return_tensors=self.return_tensors
+        )['input_ids']
+
+        y_exercise_labels[y_exercise_labels==self.tokenizer.pad_token_id] = self.label_pad_token_id
+
+        decoder_input_ids = self.model.prepare_decoder_input_ids_from_labels(y_exercise_labels)
+
+        return user_ids, difficulties, x_keyword_ids, x_attention_mask, y_exercise_labels, decoder_input_ids 
 
 
 if __name__ == '__main__':
@@ -687,8 +802,3 @@ if __name__ == '__main__':
         level=logging.INFO, 
         filemode='w'
     )  
-
-    # x = torch.tensor(np.array([[True for i in range(16446)] for j in range(16446)]))
-    # s = sys.getsizeof(x)
-    # print(s)
-    caller(func=lambda x: write(x, b=9))

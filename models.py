@@ -1,6 +1,10 @@
 import torch
+import transformers
 import torch.nn as nn
 import torch.nn.functional as F
+# from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
+from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, AutoConfig, BartTokenizer
+import numpy as np
 
 
 class PositionalEncoding(nn.Module):
@@ -48,7 +52,7 @@ class TransformerEncodingBlock(nn.Module):
         return ff_output, attn_output_weights
 
 
-class SAKT(nn.Module):
+class KnowledgeTracer(nn.Module):
     def __init__(self, num_emb, dim_emb, max_len, dim_pe, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, num_label):
         super(SAKT, self).__init__()
         self.embeddings = nn.Embedding(num_emb, dim_emb) # |formats|+|students|+|words|+|interactions|+|pad|+|unk|
@@ -106,72 +110,50 @@ class SAKT(nn.Module):
         return logits
 
 
-class DKT(nn.Module):
+
+class QuestionGenerator(nn.Module):
+    def __init__(self, model_name):
+        super(QuestionGenerator, self).__init__()
+        self.generator = AutoModelForSeq2SeqLM.from_pretrained(model_name, output_attentions=True)
+        
+
+    def forward(self, x_keyword_ids, x_attention_mask, x_knowledge_state, y_difficulties, y_exercise_ids, decoder_input_ids):
+        '''
+        x_keyword_ids: [batch_size, x_max_length]
+        x_attention_mask: [batch_size, x_max_length]
+        x_knowlegde_states: [batch_size, vocab_size]
+        x_difficulties: [batch_size, 1]
+        y_exercises: [batch_size, y_max_length]
+        decoder_input_ids: [batch_size, y_max_length]
+        
+        '''
+        outputs = self.generator(
+            input_ids=x_keyword_ids, 
+            attention_mask=x_attention_mask, 
+            decoder_input_ids=decoder_input_ids,
+            labels=y_exercise_ids
+        )
+
+        return outputs
+
+
+class AQG(nn.Module):
     def __init__(self):
-        super(SAKT, self).__init__()
         pass
 
-    
     def forward(self):
         pass
 
 
+'''
+baselines
+'''
 
-class DKT(nn.Module):
-    def __init__(self):
-        super(DKT, self).__init__()
-
-
-
-# sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
-
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, input_, index):
-        a = torch.Linear(input_.size(-1), 1)
-        a = self.sigmoid(a)
-        logits = torch.masked_select(a, index)
-        return logits
-        
-
-# print(attn_mask.shape)
-# layer = nn.MultiheadAttention(5, 1, batch_first=True)
-# attn_outputs, attn_weights = layer(query, query, query, attn_mask=attn_mask)
-# print(attn_weights)
-# print(attn_weights.shape)
-# N = 10
-# criterion = nn.CrossEntropyLoss(reduction='none', ignore_index=-1)
-# groundtruth = torch.rand(N, ).ge(0.5).type(torch.LongTensor)
-# groundtruth[7:] = -1
-# pred = torch.rand(N, 2)
-# print(groundtruth, pred)
-# loss = criterion(pred, groundtruth)
-# print(loss)
-
-# index = torch.tensor([[0, 1], [2, 1]])
-# a = torch.tensor([[[0.2, 0.8, 0.4], [0.4, 0.6, 0.5]], [[0.1, 0.9, 0.2], [0.3, 0.7, 0.4]]], requires_grad=True) # batch_size, 
-# # print(a.requires_grad)
-# # exit(1)
-# select = torch.tensor([[[1, 1, 1], [0, 0, 0]], [[1, 1, 1], [0, 0, 0]]]) > 0
-
-# max_ = torch.argmax(a)
-# print(max_.requires_grad)
-
-# net = Net()
-# gradecheck(net, (a, index))
-
-# d0 = torch.arange(a.size(0))
-# out = a[[0, 1], [[0, 1], [1, 1]], :]
-
-# print(out.requires_grad)
-
-# print(a.shape)
+## Bart
 
 
+## T5
 
-# selected = torch.masked_select(a, select)
 
-# print(selected.requires_grad)
+## GPT2
+
