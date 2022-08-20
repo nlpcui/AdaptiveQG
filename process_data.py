@@ -739,7 +739,7 @@ class DuolingoGenDataset(Dataset):
 
 class QGDataCollator:
     def __init__(self, model, tokenizer, x_max_length, y_max_length, padding='max_length', truncation='pt', label_pad_token_id=-100, return_tensors=True):
-        self.model = model
+        self.model = model # call model to construct decoder_input_ids
         self.padding = padding
         self.x_max_length = x_max_length
         self.y_max_length = y_max_length

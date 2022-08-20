@@ -1,4 +1,6 @@
-import sys, torch, os, json, configparser, argparse, datetime, logging, math
+import sys, os, json, configparser, argparse, datetime, logging, math
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,5'
+import torch
 from tqdm import tqdm
 from process_data import *
 from torch.utils.data import Dataset, DataLoader
@@ -13,6 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 from evaluate import QGEvaluator, KTEvaluator
 from copy import deepcopy
 
+#sys.path.remove('/cluster/apps/nss/gcc-6.3.0/python_gpu/3.8.5') # euler
 
 def cal_metrics(logits, y_labels):
     # cacuclate ROC and F1 score
@@ -127,8 +130,11 @@ def train_kt(args):
 
 
 
-def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
-    question_generator = QuestionGenerator(args.qg_model_name)
+def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg'):
+    question_generator = QuestionGenerator(args.qg_model_name).to(device)
+    if gpu_cnt > 1:
+        question_generator = DDP(question_generator, device_ids=[local_rank]).module
+
     bart_tokenizer = BartTokenizer.from_pretrained(args.qg_model_name)
 
     data_collator = QGDataCollator(
@@ -142,6 +148,7 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
         return_tensors='pt'
     )
 
+    logging.info('-- global_rank: {}, local_rank: {}, loading train datasets'.format(global_rank, local_rank))
     train_dataset = DuolingoGenDataset(
         split='train', 
         data_file=args.duolingo_en_es_format, 
@@ -151,21 +158,26 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
 
     if global_rank == local_rank == 0: 
         for index in random.sample(range(len(train_dataset)), 3):
-            logging.info('-- Train sampled {} example of the training dataset: {}.'.format(index, train_dataset[index]))
+            logging.info('-- Train sampled {}th example of the training dataset: {}.'.format(index, train_dataset[index]))
 
-    train_sampler = None
     if gpu_cnt > 1:
         train_sampler = DistributedSampler(train_dataset)
-
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=int(args.qg_per_device_train_batch_size), 
-        shuffle=True, 
-        collate_fn=data_collator,
-        sampler=train_sampler
-    )
-
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=int(args.qg_train_batch_size), 
+            collate_fn=data_collator,
+            sampler=train_sampler
+    	)
+    else:
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=int(args.qg_train_batch_size),
+            collate_fn=data_collator,
+            shuffle=True
+        )
+	
     # eval
+    logging.info('-- global_rank: {}, local_rank: {}, loading eval dataset'.format(global_rank, local_rank))
     eval_dataset = DuolingoGenDataset(
         split='dev', 
         data_file=args.duolingo_en_es_format,
@@ -175,22 +187,27 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
 
     if global_rank == local_rank == 0:
         for index in random.sample(range(len(eval_dataset)), 3):
-            logging.info('-- Eval sampled {} example of the training dataset: {}'.format(index, eval_dataset[index]))
+            logging.info('-- Eval sampled {}th example of the training dataset: {}'.format(index, eval_dataset[index]))
 
-    eval_sampler = None
     if gpu_cnt > 1:
         eval_sampler = DistributedSampler(eval_dataset)
-
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        batch_size=int(args.qg_per_device_eval_batch_size),
-        shuffle=True,
-        collate_fn=data_collator,
-        sampler=eval_sampler
-    )
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=int(args.qg_eval_batch_size),
+            collate_fn=data_collator,
+            sampler=eval_sampler
+        )
+    else:
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=int(args.qg_eval_batch_size),
+            shuffle=True,
+            collate_fn=data_collator
+        ) 
 
     # Train!
-    batch_steps = math.ceil(len(train_dataset)/int(args.qg_per_device_train_batch_size)/max(gpu_cnt, 1))
+    logging.info('global rank {}, local_rank {}, start training'.format(global_rank, local_rank))
+    batch_steps = math.ceil(len(train_dataset)/int(args.qg_train_batch_size)/max(gpu_cnt, 1))
     total_steps = int(args.qg_num_train_epoch) * batch_steps
     optimizer = AdamW(question_generator.parameters(), lr=float(args.qg_learning_rate))
 
@@ -210,6 +227,8 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
 
     for epoch_id in range(int(args.qg_num_train_epoch)):
         question_generator.train()
+        epoch_loss = 0
+
         if gpu_cnt > 1:
             train_dataloader.sampler.set_epoch(epoch_id)
 
@@ -224,12 +243,12 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
 
             # do train
             outputs = question_generator(
-                x_keyword_ids=x_keyword_ids,
-                x_attention_mask=x_attention_mask,
+                x_keyword_ids=x_keyword_ids.to(device),
+                x_attention_mask=x_attention_mask.to(device),
                 x_knowledge_state=None, 
                 y_difficulties=y_difficulties, 
-                y_exercise_ids=y_exercise_labels,
-                decoder_input_ids=decoder_input_ids
+                y_exercise_ids=y_exercise_labels.to(device),
+                decoder_input_ids=decoder_input_ids.to(device)
             )
             # print(type(outputs))
             loss = outputs.loss
@@ -242,7 +261,7 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
                 global_rank, local_rank, epoch_id, args.qg_num_train_epoch, batch_id, batch_steps, loss 
             ))
 
-            break
+            epoch_loss += loss
 
         # do eval
         question_generator.eval()
@@ -285,8 +304,9 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
                 epoch_id, int(args.qg_num_train_epoch), score
             }))
 
-        # save model
         validation_performance = (score['rouge-1'] + score['rouge-2'] + score['rouge-l'])/3
+
+        logging.info('-- {}th epoch, loss is {}, global_rank: {}, local_rank:{}, validation performance is {}'.format(epoch_id, epoch_loss, global_rank, local_rank, validation_performance))
         if global_rank == local_rank == 0 and validation_performance > save_info['best_validation_performance']:
             save_info['epoch'] = epoch_id
             save_info['loss'] = epoch_loss
@@ -294,19 +314,19 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, model_name='bart_qg'):
             save_info['model_state_dict'] = deepcopy(question_generator.generator().state_dict())
             save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
 
+    # save best performing model    
+    logging.info('-- global_rank:{}, local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(global_rank, local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
     
-    logging.info('-- finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
-
-    save_path = os.path.join(args.model_save_dir, '{}_{}ep.pth'.format(model_name, save_info['epoch'])) 
-    logging.info('saving model to {}'.format(save_path))
-    
-    torch.save(save_info, path=save_path)
+    if global_rank == local_rank == 0:
+        save_path = os.path.join(args.model_save_dir, '{}_{}ep.pth'.format(model_name, save_info['epoch'])) 
+        logging.info('saving model to {}'.format(save_path))
+        torch.save(save_info, path=save_path)
 
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='local_conf.ini')
+    parser.add_argument('--conf', type=str, default='euler_conf.ini')
     
     args, remaining_argv = parser.parse_known_args()
     config = configparser.ConfigParser()
@@ -323,11 +343,13 @@ if __name__ == '__main__':
     logging.basicConfig(
         format='%(asctime)s %(message)s', 
         datefmt='%Y-%d-%m %I:%M:%S %p', 
-        # filename=args.duolingo_en_es_train_log, 
+        filename=args.duolingo_en_es_train_log, 
         level=logging.INFO, 
-        filemode='w'
+        filemode='a'
     )
-
+	
+    logging.info('cuda visible devices {}'.format(os.environ["CUDA_VISIBLE_DEVICES"]))
+	
 
 
     # if args.run == 'train':
@@ -357,12 +379,20 @@ if __name__ == '__main__':
 
     if gpu_cnt == 0:
         logging.info('-- using cpu')
+        device = torch.device('cpu')
     elif gpu_cnt == 1:
-        logging.info('-- using single gpu: {}')
-        device = torch.device('cuda')
+        logging.info('-- using single gpu: {}'.format(torch.cuda.get_device_name(0)))
+        device = torch.device('cuda:0')
     else:
         dist.init_process_group('nccl')
         global_rank = dist.get_rank() # process_id
-        local_rank = global_rank % gpu_cnt
-
-    train_qg(args, gpu_cnt=gpu_cnt, global_rank=global_rank, local_rank=local_rank)
+        local_rank = int(os.environ['LOCAL_RANK'])
+        device = torch.device('cuda:{}'.format(local_rank))
+        
+        args.qg_train_batch_size = int(args.qg_train_batch_size) // gpu_cnt
+        args.qg_eval_batch_size = int(args.qg_eval_batch_size) // gpu_cnt
+        if local_rank == global_rank == 0:
+            logging.info('-- global_rank {}, local_rank {}, available gpus: {}'.format(global_rank, local_rank, [torch.cuda.get_device_name(i) for i in range(gpu_cnt)]))
+            logging.info('-- global_rank {}, local_rank {}, total batch_size is {}, per device train_batch_size is {}'.format(global_rank, local_rank, args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
+    
+    train_qg(args, gpu_cnt=gpu_cnt, global_rank=global_rank, local_rank=local_rank, device=device)
