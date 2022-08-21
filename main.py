@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from models import KnowledgeTracer, QuestionGenerator
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import get_linear_schedule_with_warmup, BartTokenizer
 from pprint import pprint
 import torch.distributed as dist
@@ -17,28 +18,6 @@ from copy import deepcopy
 
 #sys.path.remove('/cluster/apps/nss/gcc-6.3.0/python_gpu/3.8.5') # euler
 
-def cal_metrics(logits, y_labels):
-    # cacuclate ROC and F1 score
-    # logits: [example_num, label_num]
-    # labels: [example_num, ]
-
-    # metrics
-    valid_positions = y_labels.ge(0)
-
-    y_pos_probs = nn.functional.softmax(logits, dim=-1)[:,1]
-    y_pred = torch.argmax(logits, dim=-1)
-
-    y_labels_selected = torch.masked_select(y_labels, valid_positions).numpy()
-    y_pos_probs_selected = torch.masked_select(y_pos_probs, valid_positions).numpy()
-    y_pred_labels_selected = torch.masked_select(y_pred, valid_positions).numpy()
-
-    auc = roc_auc_score(y_true=y_labels_selected, y_score=y_pos_probs_selected)
-    f1 = f1_score(y_true=y_labels_selected, y_pred=y_pred_labels_selected)
-    precision = precision_score(y_true=y_labels_selected, y_pred=y_pred_labels_selected)
-    recall = recall_score(y_true=y_labels_selected, y_pred=y_pred_labels_selected)
-    accuracy = accuracy_score(y_true=y_labels_selected, y_pred=y_pred_labels_selected)
-
-    return round(auc, 4), round(precision, 4), round(recall, 4), round(f1, 4), round(accuracy, 4)
 
 
 
@@ -136,7 +115,7 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
         question_generator = DDP(question_generator, device_ids=[local_rank]).module
 
     bart_tokenizer = BartTokenizer.from_pretrained(args.qg_model_name)
-
+    
     data_collator = QGDataCollator(
         model=question_generator.generator,
         tokenizer=bart_tokenizer,
@@ -158,7 +137,7 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
 
     if global_rank == local_rank == 0: 
         for index in random.sample(range(len(train_dataset)), 3):
-            logging.info('-- Train sampled {}th example of the training dataset: {}.'.format(index, train_dataset[index]))
+            logging.info('-- {} train data in total, sampled {}th example: {}.'.format(len(train_dataset), index, train_dataset[index]))
 
     if gpu_cnt > 1:
         train_sampler = DistributedSampler(train_dataset)
@@ -187,7 +166,7 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
 
     if global_rank == local_rank == 0:
         for index in random.sample(range(len(eval_dataset)), 3):
-            logging.info('-- Eval sampled {}th example of the training dataset: {}'.format(index, eval_dataset[index]))
+            logging.info('-- {} eval data in total, sampled {}th example: {}'.format(len(eval_dataset), index, eval_dataset[index]))
 
     if gpu_cnt > 1:
         eval_sampler = DistributedSampler(eval_dataset)
@@ -235,6 +214,8 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
         for batch_id, (uids, y_difficulties, x_keyword_ids, x_attention_mask, y_exercise_labels, decoder_input_ids) in enumerate(train_dataloader):
             optimizer.zero_grad()
 
+            if batch_id > 100:
+                break
             # debug
             if epoch_id == 0 and batch_id == 0:
                 logging.debug('example collated batch:\n user_ids: {},\nx_keyword_ids: {},\nx_attention_mask: {},\ny_exercise_labels: {},\n decoder_input_ids: {},\ny_difficulties: {}'.format(
@@ -264,63 +245,97 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
             epoch_loss += loss
 
         # do eval
+        eval_batch_steps = math.ceil(len(eval_dataset) / args.qg_eval_batch_size / gpu_cnt)
         question_generator.eval()
-        qg_evaluator = QGEvaluator(generated=[], reference=[])
+        qg_evaluator = QGEvaluator(generated=[], reference=[], prompt_words=[])
         with torch.no_grad():
             if gpu_cnt > 1:
                 eval_dataloader.sampler.set_epoch(epoch_id)
             
+            prompt_words = [] 
             generated = []
             reference = []
             for batch_id, (uids, y_difficulties, x_keyword_ids, x_attention_mask, y_exercise_labels, decoder_input_ids) in enumerate(eval_dataloader):
+                if batch_id > 10:
+                    break
+                logging.info('-- global rank {}, local_rank {}, evaluating {}/{} batch, {} batch data_collected'.format(global_rank, local_rank, batch_id, eval_batch_steps, len(prompt_words)))
                 output_ids = question_generator.generator.generate(
-                    inputs=x_keyword_ids,
-                    attention_mask=x_attention_mask,
+                    inputs=x_keyword_ids.to(device),
+                    attention_mask=x_attention_mask.to(device),
                     num_beams=int(args.qg_num_beams),
                     max_length=int(args.qg_y_max_length),
                     # return_dict_in_generate=True # transformers.generation_utils.BeamSearchEncoderDecoderOutput
                 ) # [batch_size, seq_len]
                 
-                if gpu_cnt > 1:
-                    batch_input = [torch.zeros_like(x_keyword_ids) for i in range(gpu_cnt)]
-                    batch_output = [torch.zeros_like(outputs) for i in range(gpu_cnt)]
-                    dist.all_gather(batch_input, x_keyword_ids)
-                    dist.all_gather(batch_output, output_ids)
-
-                    generated.append(batch_output)
-                    reference.append(batch_input)
+                # postprocess
+                ## pad output_ids to collect across devices
+                pad_length = int(args.qg_y_max_length) - output_ids.size(-1)
+                if pad_length > 0:
+                    output_ids = F.pad(output_ids, pad=(0, pad_length), value=bart_tokenizer.pad_token_id) 
+                ## recover pad labels
+                y_exercise_labels[y_exercise_labels==int(args.qg_label_pad_token_id)] = bart_tokenizer.pad_token_id 
+                # end postprocess
                 
+                if gpu_cnt > 1:
+                    batch_prompt_words = [torch.zeros_like(x_keyword_ids).to(device) for i in range(gpu_cnt)]
+                    batch_reference = [torch.zeros_like(y_exercise_labels).to(device) for i in range(gpu_cnt)]
+                    batch_generated = [torch.zeros_like(output_ids).to(device) for i in range(gpu_cnt)]
+                    
+                    dist.all_gather(batch_prompt_words, x_keyword_ids.to(device)) # [batch_size, input_len] * gpu_cnt
+                    dist.all_gather(batch_reference, y_exercise_labels.to(device))
+                    dist.all_gather(batch_generated, output_ids)
+                    
+                    # logging.info('-- rank: {}, gathered prompt {}'.format(local_rank, batch_prompt_words))
+                    # logging.info('-- rank: {}, gathered generated {}'.format(local_rank, batch_generated))
+                    # logging.info('-- rank: {}, gathered reference {}'.format(local_rank, batch_reference))
+                    
+                    prompt_words.extend(batch_prompt_words)
+                    reference.extend(batch_reference)
+                    generated.extend(batch_generated)
                 else:
+                    prompt_words.append(x_keywords_ids.to(device))
                     generated.append(output_ids)
-                    reference.append(x_keyword_ids)
+                    reference.append(y_exercise_labels.to(device))
             
-            qg_evaluator.generated  = bart_tokenizer.batch_decode(torch.cat(generated, 0), skip_special_token=True)
-            qg_evaluator.reference = bart_tokenizer.batch_decode(torch.cat(reference, 0), skip_special_token=True)
-
-
-        score = qg_evaluator.score()
+            logging.info(' -- global rank {}, local rank {}, complete evalution'.format(global_rank, local_rank))
+        
+        ## compute metrics
         if global_rank == local_rank == 0:
+            prompt_words = torch.cat(prompt_words, dim=0).cpu()
+            generated = torch.cat(generated, dim=0).cpu()
+            reference = torch.cat(reference, dim=0).cpu()
+            logging.info('-- collect {} data for evaluation'.format(prompt_words.size(0)))
+            logging.info('-- shape prompt: {}, generated: {}, reference: {}'.format(prompt_words.shape, generated.shape, reference.shape))
+            qg_evaluator.prompt_words = bart_tokenizer.batch_decode(prompt_words, skip_special_token=True) 
+            qg_evaluator.generated  = bart_tokenizer.batch_decode(generated, skip_special_token=True)
+            qg_evaluator.reference = bart_tokenizer.batch_decode(reference, skip_special_token=True)
+            logging.info('-- rank {} computing metrics ...'.format(local_rank))
+            score = qg_evaluator.compute_metrics()
             logging.info('{}/{} epoch, performance on eval set: {}'.format({
                 epoch_id, int(args.qg_num_train_epoch), score
             }))
 
-        validation_performance = (score['rouge-1'] + score['rouge-2'] + score['rouge-l'])/3
+            validation_performance = (score['rouge-1'] + score['rouge-2'] + score['rouge-l'])/3
 
-        logging.info('-- {}th epoch, loss is {}, global_rank: {}, local_rank:{}, validation performance is {}'.format(epoch_id, epoch_loss, global_rank, local_rank, validation_performance))
-        if global_rank == local_rank == 0 and validation_performance > save_info['best_validation_performance']:
-            save_info['epoch'] = epoch_id
-            save_info['loss'] = epoch_loss
-            save_info['best_validation_performance'] = validation_performance
-            save_info['model_state_dict'] = deepcopy(question_generator.generator().state_dict())
-            save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
-
-    # save best performing model    
-    logging.info('-- global_rank:{}, local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(global_rank, local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
+            logging.info('-- {}th epoch, loss is {}, global_rank: {}, local_rank:{}, validation performance is {}'.format(epoch_id, epoch_loss, global_rank, local_rank, validation_performance))
+            if validation_performance > save_info['best_validation_performance']:
+                save_info['epoch'] = epoch_id
+                save_info['loss'] = epoch_loss
+                save_info['best_validation_performance'] = validation_performance
+                save_info['model_state_dict'] = deepcopy(question_generator.generator().state_dict())
+                save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
     
+            logging.info('-- global_rank:{}, local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(global_rank, local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
+    # save best performing model    
     if global_rank == local_rank == 0:
         save_path = os.path.join(args.model_save_dir, '{}_{}ep.pth'.format(model_name, save_info['epoch'])) 
         logging.info('saving model to {}'.format(save_path))
         torch.save(save_info, path=save_path)
+
+
+
+def evaluate():
+    pass
 
 
 
@@ -384,15 +399,16 @@ if __name__ == '__main__':
         logging.info('-- using single gpu: {}'.format(torch.cuda.get_device_name(0)))
         device = torch.device('cuda:0')
     else:
-        dist.init_process_group('nccl')
-        global_rank = dist.get_rank() # process_id
         local_rank = int(os.environ['LOCAL_RANK'])
         device = torch.device('cuda:{}'.format(local_rank))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group('nccl', init_method='env://', world_size=gpu_cnt, rank=local_rank)
+        global_rank = dist.get_rank() # process_id
         
         args.qg_train_batch_size = int(args.qg_train_batch_size) // gpu_cnt
         args.qg_eval_batch_size = int(args.qg_eval_batch_size) // gpu_cnt
         if local_rank == global_rank == 0:
             logging.info('-- global_rank {}, local_rank {}, available gpus: {}'.format(global_rank, local_rank, [torch.cuda.get_device_name(i) for i in range(gpu_cnt)]))
-            logging.info('-- global_rank {}, local_rank {}, total batch_size is {}, per device train_batch_size is {}'.format(global_rank, local_rank, args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
+            logging.info('-- global_rank {}, local_rank {}, total_train_batch_size is {}, per_device_train_batch_size is {}'.format(global_rank, local_rank, args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
     
     train_qg(args, gpu_cnt=gpu_cnt, global_rank=global_rank, local_rank=local_rank, device=device)
