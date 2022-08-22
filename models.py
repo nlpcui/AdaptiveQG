@@ -111,7 +111,7 @@ class KnowledgeTracer(nn.Module):
 
 
 
-class QuestionGenerator(nn.Module):
+class AdaptiveQuestionGenerator(nn.Module):
     def __init__(self, model_name):
         super(QuestionGenerator, self).__init__()
         self.generator = AutoModelForSeq2SeqLM.from_pretrained(model_name, output_attentions=True)
@@ -148,6 +148,19 @@ class AQG(nn.Module):
 '''
 baselines
 '''
+
+
+class NonAdaptiveQuestionGenerator(nn.module):
+    def __init__(self, model_name, num_difficulty_levels, num_embeddings, enable_difficulty):
+        # model options: T5, Bart, 
+        config = AutoConfig.from_pretrained(model_name)
+        self.generator = AutoModelForSeq2SeqLM.from_config(model_name)
+
+
+    def forward(self):
+        
+        pass
+
 
 ## Bart
 

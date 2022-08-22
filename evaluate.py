@@ -1,15 +1,26 @@
 import sys, json, spacy
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
 from rouge import Rouge
-
+import pandas as pd
 from nltk.translate.bleu_score import sentence_bleu
+import numpy as np
 
 
 class QGEvaluator:
-    def __init__(self, prompt_words, generated, reference):
+    def __init__(self, word_file, prompt_words, generated, reference, difficulty_scores, difficulty_levels):
+
+        self.word_difficulty = {}
+        df = pd.read_csv(word_file)
+        for idx, row in df.iterrows():
+            self.word_difficulty[row['word']] = row['error_rate']
+
         self.prompt_words = prompt_words
         self.generated = generated
         self.reference = reference
+        self.difficulty_scores = difficulty_scores
+        self.difficulty_levels = difficulty_levels
+        self.generated_difficulty_scores = []
+        self.generated_difficulty_levels = []
 
         self.rouge = Rouge()
         self.tokenizer = spacy.load('en_core_web_sm').tokenizer
@@ -44,6 +55,32 @@ class QGEvaluator:
                     cover_cnt += 1
         
         return {'coverage': cover_cnt/total_cnt}
+
+
+    def compute_difficulty_consistency(self):
+        for idx in range(len(self.generated)):
+            difficulty_score = self.__compute_difficulty_score(self.generated[idx])
+            difficulty_level = min(3, difficulty_score//0.5)
+            self.generated_difficulty_scores.append(difficulty_score)
+            self.generated_difficulty_levels.append(difficulty_level)
+
+        difficulty_pccs = np.corrcoef(self.difficulty_scores, self.generated_difficulty_scores) = # pearson coefficient  
+        difficulty_accuarcy = accuracy_score(y_true=self.difficulty_levels, y_pred=self.generated_difficulty_levels)
+
+        return {'difficulty_pccs': difficulty_pccs, 'diffculty_accuarcy': diffculty_accuarcy}    
+
+
+    def __compute_difficulty_score(self, sentence):
+        difficulty_score = 0
+        words = self.tokenizer(sentence)
+        for word in words:
+            if word not in self.word_difficulty:
+                continue # TODO: how to handle?
+            difficulty_score += self.word_difficulty[word]
+        return difficulty_score
+
+    def __compute_difficulty_level(self, difficulty_score):
+        return min(3, difficulty_score // 0.5)
 
 
 

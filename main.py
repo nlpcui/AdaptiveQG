@@ -105,11 +105,11 @@ def train_kt(args):
             # metrics
             auc, precision, recall, f1_score, accuracy = cal_metrics(logits.cpu().detach(), y_labels.cpu().detach())
 
-            print('In [{}/{}] epoch, [{}/{}] batch, loss:{}, auc:{}, precision:{}, recall:{}, f1_score:{}, accuracy:{}, --{}'.format(epoch, args.epoch, batch_id, len(dataset)//args.batch_size, loss, auc, precision, recall, f1_score, accuracy, datetime.datetime.now()))
+            print('-- In [{}/{}] epoch, [{}/{}] batch, loss:{}, auc:{}, precision:{}, recall:{}, f1_score:{}, accuracy:{}, --{}'.format(epoch, args.epoch, batch_id, len(dataset)//args.batch_size, loss, auc, precision, recall, f1_score, accuracy, datetime.datetime.now()))
 
 
 
-def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg'):
+def train_adaptive_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg'):
     question_generator = QuestionGenerator(args.qg_model_name).to(device)
     if gpu_cnt > 1:
         question_generator = DDP(question_generator, device_ids=[local_rank]).module
@@ -231,7 +231,6 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
                 y_exercise_ids=y_exercise_labels.to(device),
                 decoder_input_ids=decoder_input_ids.to(device)
             )
-            # print(type(outputs))
             loss = outputs.loss
             
             loss.backward()
@@ -326,6 +325,7 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
                 save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
     
             logging.info('-- global_rank:{}, local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(global_rank, local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
+    
     # save best performing model    
     if global_rank == local_rank == 0:
         save_path = os.path.join(args.model_save_dir, '{}_{}ep.pth'.format(model_name, save_info['epoch'])) 
@@ -334,8 +334,258 @@ def train_qg(args, gpu_cnt, global_rank, local_rank, device, model_name='bart_qg
 
 
 
-def evaluate():
-    pass
+def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device):
+
+    # baseline options: Bart, T-5, 
+    config = AutoConfig.from_pretrained(model_name)
+    question_generator = AutoModelForSeq2SeqLM.from_config(args.qg_model_name).to(device)
+
+    if gpu_cnt > 1:
+        question_generator = DDP(question_generator, device_ids=[local_rank]).module
+
+    tokenizer = AutoTokenizer.from_pretrained(args.qg_model_name)
+
+    if enable_difficulty: # input: prompt words + difficulty
+        difficulty_control_tokens = {'additional_special_tokens': ['<dif_{}>'.format(i) for i in range(4)]}
+        added_special_token_ids = tokenizer.add_special_tokens(difficulty_control_tokens)
+        question_generator.resize_token_embeddings(len(tokenizer))
+        logging.info('-- added special tokens :{}'.format([list(zip(tokenizer.additional_special_tokens, tokenizer.additional_special_tokens_ids))]))
+    
+    
+    sampler = WordSampler(sample_rate=args.sample_rate)
+
+    logging.info('-- local_rank: {}, loading train datasets'.format(local_rank))
+    train_dataset = DuolingoNonAdaptiveGenDataset(
+        data_file=args.duolingo_en_es_non_adaptive_exercise_gen_train, 
+        tokenizer=tokenizer, 
+        model=question_generator.generator, 
+        sampler=sampler,
+        enable_difficulty=enable_difficulty
+    )
+
+    collate_fn = train_dataset.construct_collate_fn(
+        tokenizer=tokenizer, 
+        x_max_length=int(args.qg_x_max_length), 
+        y_max_length=int(args.qg_y_max_length), 
+        padding='max_length', 
+        truncation=True, 
+        return_tensors='pt', 
+        label_pad_token_id=-100
+    )
+
+    if global_rank == local_rank == 0: 
+        for index in random.sample(range(len(train_dataset)), 3):
+            logging.info('-- {} train data in total, sampled {}th example: {}.'.format(len(train_dataset), index, train_dataset[index]))
+
+    if gpu_cnt > 1:
+        train_sampler = DistributedSampler(train_dataset)
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=int(args.qg_train_batch_size), 
+            collate_fn=collate_fn,
+            sampler=train_sampler
+    	)
+    else:
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=int(args.qg_train_batch_size),
+            collate_fn=collate_fn,
+            shuffle=True
+        )
+	
+    logging.info('-- local_rank: {}, loading eval dataset'.format(local_rank))
+    train_dataset = DuolingoNonAdaptiveGenDataset(
+        data_file=args.duolingo_en_es_non_adaptive_exercise_gen_dev, 
+        tokenizer=tokenizer, 
+        model=question_generator, 
+        sampler=sampler,
+        enable_difficulty=enable_difficulty
+    )
+    if global_rank == local_rank == 0:
+        for index in random.sample(range(len(eval_dataset)), 3):
+            logging.info('-- {} eval data in total, sampled {}th example: {}'.format(len(eval_dataset), index, eval_dataset[index]))
+
+    if gpu_cnt > 1:
+        eval_sampler = DistributedSampler(eval_dataset)
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=int(args.qg_eval_batch_size),
+            collate_fn=data_collator,
+            sampler=eval_sampler
+        )
+    else:
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=int(args.qg_eval_batch_size),
+            shuffle=True,
+            collate_fn=data_collator
+        ) 
+
+    # Train!
+    batch_steps = math.ceil(len(train_dataset)/int(args.qg_train_batch_size)/max(gpu_cnt, 1))
+    total_steps = int(args.qg_num_train_epoch) * batch_steps
+    warmup_steps = int(total_steps*float(args.qg_warmup_rate))
+
+    logging.info('local_rank {}, start training, total steps {}, warm up steps {}'.format(local_rank, total_steps, warmup_steps))
+    
+    optimizer = AdamW(question_generator.parameters(), lr=float(args.qg_learning_rate))
+
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+
+    save_info = {
+        'epoch': 0,
+        'loss': 0,
+        'best_validation_performance': 0,
+        'model_state_dict': None,
+        'optimizer_state_dict': None
+    }
+
+    for epoch_id in range(int(args.qg_num_train_epoch)):
+        question_generator.train()
+        epoch_loss = 0
+
+        if gpu_cnt > 1:
+            train_dataloader.sampler.set_epoch(epoch_id)
+
+        for batch_id, (x_difficulty_scores, x_difficulty_levels, x_prompt_word_ids, x_attention_mask, y_exercise_labels, y_decoder_input_ids) in enumerate(train_dataloader):
+            optimizer.zero_grad()
+            # debug
+            if epoch_id == 0 and batch_id == 0:
+                logging.debug('example collated batch:\n x_difficulty_scores: {}, \n x_difficulty_levels: {}, \n x_prompt_word_ids: {},\n x_attention_mask: {},\n y_exercise_labels: {}, \n y_decoder_input_ids: {}'.format(
+                    x_difficulty_scores, x_difficulty_levels, x_prompt_word_ids, x_attention_mask, y_exercise_labels, y_decoder_input_ids,
+                ))
+
+            # do train
+            outputs = question_generator(
+                input_ids=x_keyword_ids.to(device),
+                attention_mask=x_attention_mask.to(device),
+                labels=y_exercise_labels.to(device),
+                decoder_input_ids=y_decoder_input_ids.to(device)
+            )
+
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+
+            logging.info('local_rank: {}, {}/{} epoch, {}/{} batch, loss is {}'.format(
+                local_rank, epoch_id, args.qg_num_train_epoch, batch_id, batch_steps, loss 
+            ))
+
+            epoch_loss += loss
+
+
+        # do_eval
+        eval_batch_steps = int(len(eval_dataset) / args.qg_eval_batch_size / gpu_cnt) + 1
+        question_generator.eval()
+        qg_evaluator = QGEvaluator(generated=[], reference=[], prompt_words=[], difficulty_scores=[], difficulty_levels=[])
+        with torch.no_grad():
+            if gpu_cnt > 1:
+                eval_dataloader.sampler.set_epoch(epoch_id)
+            
+
+            difficulty_scores = []
+            difficulty_levels = []
+            prompt_words = [] 
+            generated = []
+            reference = []
+
+            for batch_id, (x_difficulty_scores, x_difficulty_levels, x_prompt_word_ids, x_attention_mask, y_exercise_labels, y_decoder_input_ids ) in enumerate(eval_dataloader):
+                if batch_id > 10:
+                    break
+                logging.info('-- local_rank {}, evaluating {}/{} batch, {} batch data_collected'.format(local_rank, batch_id, eval_batch_steps, len(prompt_words)))
+                
+                # [batch_size, seq_len]
+                output_ids = question_generator.generate(
+                    inputs=x_prompt_word_ids.to(device),
+                    attention_mask=x_attention_mask.to(device),
+                    num_beams=int(args.qg_num_beams),
+                    max_length=int(args.qg_y_max_length),
+                    # return_dict_in_generate=True # transformers.generation_utils.BeamSearchEncoderDecoderOutput
+                ) 
+                
+                # postprocess
+                ## pad output_ids to collect across devices
+                pad_length = int(args.qg_y_max_length) - output_ids.size(-1)
+                if pad_length > 0:
+                    output_ids = F.pad(output_ids, pad=(0, pad_length), value=bart_tokenizer.pad_token_id) 
+                ## recover pad labels
+                y_exercise_labels[y_exercise_labels==int(args.qg_label_pad_token_id)] = bart_tokenizer.pad_token_id 
+                # end postprocess
+                
+                if gpu_cnt > 1:
+                    # collect evaluation data across devices
+                    batch_difficulty_scores = [torch.zeros_like(x_difficulty_scores).to(device) for i in range(gpu_cnt)]
+                    batch_difficulty_levels = [torch.zeros_like(x_difficulty_levels).to(device) for i in range(gpu_cnt)]
+                    batch_prompt_words = [torch.zeros_like(x_prompt_word_ids).to(device) for i in range(gpu_cnt)]
+                    batch_reference = [torch.zeros_like(y_exercise_labels).to(device) for i in range(gpu_cnt)]
+                    batch_generated = [torch.zeros_like(output_ids).to(device) for i in range(gpu_cnt)]
+                    
+                    dist.all_gather(batch_difficulty_scores, x_difficulty_scores)
+                    dist.all_gather(batch_difficulty_levels, x_difficulty_levels)
+                    dist.all_gather(batch_prompt_words, x_prompt_word_ids.to(device)) # [batch_size, input_len] * gpu_cnt
+                    dist.all_gather(batch_reference, y_exercise_labels.to(device))
+                    dist.all_gather(batch_generated, output_ids)
+                    
+                    difficulty_scores.extend(batch_difficulty_scores)
+                    difficulty_levels.extend(batch_difficulty_levels)
+                    prompt_words.extend(batch_prompt_words)
+                    reference.extend(batch_reference)
+                    generated.extend(batch_generated)
+
+                else:
+                    difficulty_scores.extend(batch_difficulty_scores)
+                    difficulty_levels.extend(batch_difficulty_levels)
+                    prompt_words.append(x_keywords_ids.to(device))
+                    generated.append(output_ids)
+                    reference.append(y_exercise_labels.to(device))
+            
+            logging.info(' -- local_rank {}, complete evalution'.format(local_rank))
+        
+        ## compute metrics
+        if global_rank == local_rank == 0:
+            
+            difficulty_scores = torch.cat(difficulty_scores, dim=0).detach().cpu().numpy().tolist()
+            difficulty_levels = torch.cat(difficulty_levels, dim=0).detach().cpu().numpy().tolist()
+            prompt_words = torch.cat(prompt_words, dim=0).cpu()
+            generated = torch.cat(generated, dim=0).cpu()
+            reference = torch.cat(reference, dim=0).cpu()
+            
+            logging.info('-- collect {} data for evaluation'.format(prompt_words.size(0)))
+
+            qg_evaluator.difficulty_scores = difficulty_scores
+            qg_evaluator.difficulty_levels = difficulty_levels
+            qg_evaluator.prompt_words = bart_tokenizer.batch_decode(prompt_words, skip_special_token=True) 
+            qg_evaluator.generated  = bart_tokenizer.batch_decode(generated, skip_special_token=True)
+            qg_evaluator.reference = bart_tokenizer.batch_decode(reference, skip_special_token=True)
+            
+            logging.info('-- local_rank {} computing metrics ...'.format(local_rank))
+            score = qg_evaluator.compute_metrics()
+            logging.info('{}/{} epoch, performance on eval set: {}'.format({
+                epoch_id, int(args.qg_num_train_epoch), score
+            }))
+
+            validation_performance = (score['rouge-1'] + score['rouge-2'] + score['rouge-l'])/3
+
+            logging.info('-- {}th epoch, loss is {}, local_rank:{}, validation performance is {}'.format(epoch_id, epoch_loss, local_rank, validation_performance))
+            if validation_performance > save_info['best_validation_performance']:
+                save_info['epoch'] = epoch_id
+                save_info['loss'] = epoch_loss
+                save_info['best_validation_performance'] = validation_performance
+                save_info['model_state_dict'] = deepcopy(question_generator.generator().state_dict())
+                save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
+    
+            logging.info('-- local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
+    
+    # save best performing model    
+    if global_rank == local_rank == 0:
+        save_path = os.path.join(args.model_save_dir, 'non_adaptive_{}_{}ep.pth'.format(model_name, save_info['epoch'])) 
+        logging.info('saving model to {}'.format(save_path))
+        torch.save(save_info, path=save_path)
 
 
 
@@ -374,19 +624,6 @@ if __name__ == '__main__':
     # elif args.run == 'val':
     #     val(args)
 
-    # format raw data
-    # DuolingoKTDataset.get_format_datat(
-    #     train_raw=args.duolingo_en_es_train_raw, 
-    #     dev_raw=args.duolingo_en_es_dev_raw, 
-    #     dev_key_raw=args.duolingo_en_es_dev_key_raw, 
-    #     test_raw=args.duolingo_en_es_test_raw, 
-    #     test_key_raw=args.duolingo_en_es_test_key_raw, 
-    #     format_output=args.duolingo_en_es_format, 
-    #     vocab_file=args.duolingo_en_es_vocab, 
-    #     word_file=args.duolingo_en_es_words, 
-    #     exercise_file=args.duolingo_en_es_exercises
-    # )
-    
 
     gpu_cnt = torch.cuda.device_count() # gpu_cnt_per_machine
     global_rank = 0
@@ -403,7 +640,7 @@ if __name__ == '__main__':
         device = torch.device('cuda:{}'.format(local_rank))
         torch.cuda.set_device(local_rank)
         dist.init_process_group('nccl', init_method='env://', world_size=gpu_cnt, rank=local_rank)
-        global_rank = dist.get_rank() # process_id
+        # global_rank = dist.get_rank() # process_id
         
         args.qg_train_batch_size = int(args.qg_train_batch_size) // gpu_cnt
         args.qg_eval_batch_size = int(args.qg_eval_batch_size) // gpu_cnt
@@ -411,4 +648,4 @@ if __name__ == '__main__':
             logging.info('-- global_rank {}, local_rank {}, available gpus: {}'.format(global_rank, local_rank, [torch.cuda.get_device_name(i) for i in range(gpu_cnt)]))
             logging.info('-- global_rank {}, local_rank {}, total_train_batch_size is {}, per_device_train_batch_size is {}'.format(global_rank, local_rank, args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
     
-    train_qg(args, gpu_cnt=gpu_cnt, global_rank=global_rank, local_rank=local_rank, device=device)
+    train_non_adaptive_baselines(args, gpu_cnt=gpu_cnt, local_rank=local_rank, device=device)
