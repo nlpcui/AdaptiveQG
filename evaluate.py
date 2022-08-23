@@ -1,10 +1,10 @@
-import sys, json, spacy
+import sys, json, spacy, logging
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
 from rouge import Rouge
 import pandas as pd
 from nltk.translate.bleu_score import sentence_bleu
 import numpy as np
-
+from nltk import word_tokenize
 
 class QGEvaluator:
     def __init__(self, word_file, prompt_words, generated, reference, difficulty_scores, difficulty_levels):
@@ -13,7 +13,9 @@ class QGEvaluator:
         df = pd.read_csv(word_file)
         for idx, row in df.iterrows():
             self.word_difficulty[row['word']] = row['error_rate']
-
+        
+        # logging.info('-- word_difficulty {}'.format(self.word_difficulty))
+        
         self.prompt_words = prompt_words
         self.generated = generated
         self.reference = reference
@@ -23,23 +25,31 @@ class QGEvaluator:
         self.generated_difficulty_levels = []
 
         self.rouge = Rouge()
-        self.tokenizer = spacy.load('en_core_web_sm').tokenizer
+        self.tokenizer = word_tokenize
 
     def compute_metrics(self):
         result = {}
         
         rouge_score = self.compute_rouge()
         result.update(rouge_score)
+       
+        difficulty_consistency = self.compute_difficulty_consistency()
+        result.update(difficulty_consistency)
 
+        coverage = self.compute_coverage()
+        result.update(coverage)
+         
         return result
 
+
     def compute_rouge(self):
-        scores = self.rouge.get_scores(self.generated, self.reference)
-
-        rouge_1 = sum([score['rouge-1']['f'] for score in scores])/len(self.generated)
-        rouge_2 = sum([score['rouge-2']['f'] for score in scores])/len(self.generated)
-        rouge_l = sum([score['rouge-l']['f'] for score in scores])/len(self.generated)
-
+        try:
+            scores = self.rouge.get_scores(self.generated, self.reference)
+            rouge_1 = sum([score['rouge-1']['f'] for score in scores])/len(self.generated)
+            rouge_2 = sum([score['rouge-2']['f'] for score in scores])/len(self.generated)
+            rouge_l = sum([score['rouge-l']['f'] for score in scores])/len(self.generated)
+        except Exception:
+            rouge_1 = rouge_2 = rouge_l = 0
         return {'rouge-1': rouge_1, 'rouge-2': rouge_2, 'rouge-l':rouge_l}
 
 
@@ -49,7 +59,7 @@ class QGEvaluator:
         for idx in range(len(self.prompt_words)):
             prompt_words = self.tokenizer(self.prompt_words[idx])
             generated_words = self.tokenizer(self.generated[idx])
-            total += len(prompt_words)
+            total_cnt += len(prompt_words)
             for word in prompt_words:
                 if word in generated_words:
                     cover_cnt += 1
@@ -64,25 +74,33 @@ class QGEvaluator:
             self.generated_difficulty_scores.append(difficulty_score)
             self.generated_difficulty_levels.append(difficulty_level)
 
-        difficulty_pccs = np.corrcoef(self.difficulty_scores, self.generated_difficulty_scores) = # pearson coefficient  
-        difficulty_accuarcy = accuracy_score(y_true=self.difficulty_levels, y_pred=self.generated_difficulty_levels)
+        difficulty_pccs = np.corrcoef(self.difficulty_scores, self.generated_difficulty_scores)[0][1] # pearson coefficient  
+        difficulty_accuracy = accuracy_score(y_true=self.difficulty_levels, y_pred=self.generated_difficulty_levels)
 
-        return {'difficulty_pccs': difficulty_pccs, 'diffculty_accuarcy': diffculty_accuarcy}    
+        return {'difficulty_pccs': difficulty_pccs, 'diffculty_accuarcy': difficulty_accuracy}    
 
 
     def __compute_difficulty_score(self, sentence):
         difficulty_score = 0
         words = self.tokenizer(sentence)
+        # logging.info('-- sentence {}'.format(sentence))
+        # logging.info('-- words {}'.format(words))
         for word in words:
             if word not in self.word_difficulty:
                 continue # TODO: how to handle?
             difficulty_score += self.word_difficulty[word]
         return difficulty_score
 
+
     def __compute_difficulty_level(self, difficulty_score):
         return min(3, difficulty_score // 0.5)
 
-
+    
+    def output_result(self, filepath):
+        with open(filepath, 'w') as fp:
+            for idx in range(len(self.prompt_words)):
+                fp.write(json.dumps({'prompt_words': self.prompt_words[idx], 'difficulty_score': self.difficulty_scores[idx], 'difficulty_level': self.difficulty_levels[idx], 'generated': self.generated[idx], 'reference': self.reference[idx], 'generated_difficulty_score': self.generated_difficulty_scores[idx], 'generated_difficulty_level': self.generated_difficulty_levels[idx]})+'\n')
+        
 
 class KTEvaluator:
     def __init__(self, logits, labels):

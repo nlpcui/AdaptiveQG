@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from decimal import Decimal
 from nltk import word_tokenize
-from transformers import AutoModelForSeq2SeqLM, BartTokenizer
+from transformers import AutoModelForSeq2SeqLM, BartTokenizer, AutoConfig, AutoTokenizer
 
 
 
@@ -443,7 +443,8 @@ class DuolingoNonAdaptiveGenDataset(Dataset):
         '''
         non-adaptive QG, two inputs: prompt words/difficulty score
         '''
-
+        
+        self.enable_difficulty = enable_difficulty
         self.sampler = sampler
         
         self.x_difficulty_scores = []
@@ -459,6 +460,12 @@ class DuolingoNonAdaptiveGenDataset(Dataset):
         with open(data_file, 'r') as fp:
             for line in fp.readlines():
                 data = json.loads(line.strip())
+                
+                # prompt words
+                sampled_words = self.sampler.sample(tokens=data['tokens'], pos_tags=data['pos_tags'])
+                if not sampled_words:
+                    continue # discard one-word sentence
+                self.x_prompt_words.append(' '.join(sampled_words))
 
                 # difficulty score
                 self.x_difficulty_scores.append(data['sum_word_error_rate'])
@@ -474,37 +481,35 @@ class DuolingoNonAdaptiveGenDataset(Dataset):
                 else:
                     self.y_exercises.append(data['text'])
                 
-                # prompt words
-                self.x_prompt_words.append(self.sampler.sample(tokens=data['tokens'], pos_tags=data['pos_tags']))
 
 
-        logging.info(sorted(self.difficulty_distributions.items(), key=lambda x:x[0]))
+        # logging.info(sorted(self.difficulty_distributions.items(), key=lambda x:x[0]))
         ## difficulty level distributions. (//0.5)
         ## train: [(0, 1660), (1, 3663), (2, 1489), (3, 279), (4, 44), (5, 12), (6, 8), (7, 2)]
         ## dev:
         ## test: 
 
     def __getitem__(self, idx):
-        return self.x_difficulty_scores[idx], self.x_difficulty_levels, self.x_prompt_words[idx],  self.y_exercises[idx]
+        return self.x_difficulty_scores[idx], self.x_difficulty_levels[idx], self.x_prompt_words[idx],  self.y_exercises[idx]
 
     
-    def construct_collate_fn(self, tokenizer, x_max_length, y_max_length, padding='max_length', truncation=True, return_tensors='pt', label_pad_token_id=-100):
+    def construct_collate_fn(self, tokenizer, model, x_max_length, y_max_length, padding='max_length', truncation=True, return_tensors='pt', label_pad_token_id=-100):
         
         def collate_fn(batch_data):    
 
             x_difficulty_scores = torch.tensor([data[0] for data in batch_data])
-            x_difficulty_levels = torch.tenssor([data[1]] for data in batch_data)
-
+            x_difficulty_levels = torch.tensor([data[1] for data in batch_data])
+            
             x_encoded = tokenizer([data[2] for data in batch_data], max_length=x_max_length, padding=padding, truncation=truncation, return_tensors=return_tensors)
 
             x_prompt_word_ids = x_encoded['input_ids']
             x_attention_mask = x_encoded['attention_mask']
-            y_exercise_labels = self.tokenizer(
+            y_exercise_labels = tokenizer(
                 [data[3] for data in batch_data],
-                max_length=self.y_max_length,
-                padding=self.padding,
-                truncation=self.truncation,
-                return_tensors=self.return_tensors
+                max_length=y_max_length,
+                padding=padding,
+                truncation=truncation,
+                return_tensors=return_tensors
             )['input_ids']
 
             y_exercise_labels[y_exercise_labels==tokenizer.pad_token_id] = label_pad_token_id

@@ -150,7 +150,7 @@ baselines
 '''
 
 
-class NonAdaptiveQuestionGenerator(nn.module):
+class NonAdaptiveQuestionGenerator(nn.Module):
     def __init__(self, model_name, num_difficulty_levels, num_embeddings, enable_difficulty):
         # model options: T5, Bart, 
         config = AutoConfig.from_pretrained(model_name)
