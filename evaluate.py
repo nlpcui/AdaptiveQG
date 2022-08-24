@@ -27,12 +27,15 @@ class QGEvaluator:
         self.rouge = Rouge()
         self.tokenizer = word_tokenize
 
+        self.rouge_scores = []
+        self.coverage = []
+
     def compute_metrics(self):
         result = {}
         
         rouge_score = self.compute_rouge()
         result.update(rouge_score)
-       
+         
         difficulty_consistency = self.compute_difficulty_consistency()
         result.update(difficulty_consistency)
 
@@ -43,15 +46,21 @@ class QGEvaluator:
 
 
     def compute_rouge(self):
-        try:
-            scores = self.rouge.get_scores(self.generated, self.reference)
-            rouge_1 = sum([score['rouge-1']['f'] for score in scores])/len(self.generated)
-            rouge_2 = sum([score['rouge-2']['f'] for score in scores])/len(self.generated)
-            rouge_l = sum([score['rouge-l']['f'] for score in scores])/len(self.generated)
-        except Exception:
-            rouge_1 = rouge_2 = rouge_l = 0
-        return {'rouge-1': rouge_1, 'rouge-2': rouge_2, 'rouge-l':rouge_l}
+        for idx in range(len(self.generated)):
+            try:
+                score = self.rouge.get_scores([self.generated[idx]], [self.reference[idx]])
+                self.rouge_scores.append(score[0])
+            except Exception:
+                self.rouge_scores.append({'rouge-1':{'r':0, 'p':0, 'f':0}, 'rouge-2':{'r':0, 'p':0, 'f':0}, 'rouge-l':{'r':0, 'p':0, 'f':0}})
 
+        rouge_1 = rouge_2 = rouge_l = 0
+        for score in self.rouge_scores:
+            rouge_1 += score['rouge-1']['f']
+            rouge_2 += score['rouge-2']['f']
+            rouge_l += score['rouge-l']['f']
+       
+        return {'rouge-1': rouge_1/len(self.generated), 'rouge-2':rouge_2/len(self.generated), 'rouge-l': rouge_l/len(self.generated)}
+       
 
     def compute_coverage(self):
         cover_cnt = 0

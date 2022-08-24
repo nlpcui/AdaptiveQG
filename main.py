@@ -1,5 +1,5 @@
 import sys, os, json, configparser, argparse, datetime, logging, math
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,4,5,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3,4,6,7'
 import torch
 from tqdm import tqdm
 from process_data import *
@@ -199,7 +199,7 @@ def train_adaptive_qg(args, gpu_cnt, global_rank, local_rank, device, model_name
     save_info = {
         'epoch': 0,
         'loss': 0,
-        'best_validation_performance': 0,
+        'best_validation_performance': -1,
         'model_state_dict': None,
         'optimizer_state_dict': None
     }
@@ -337,13 +337,14 @@ def train_adaptive_qg(args, gpu_cnt, global_rank, local_rank, device, model_name
 def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_difficulty):
 
     # baseline options: Bart, T-5, 
-    config = AutoConfig.from_pretrained(args.qg_model_name)
-    question_generator = AutoModelForSeq2SeqLM.from_config(config).to(device)
+    # config = AutoConfig.from_pretrained(args.qg_model_name)
+    logging.info('-- model name is {}'.format(args.qg_model_name))
+    question_generator = AutoModelForSeq2SeqLM.from_pretrained(args.qg_model_name).to(device)
 
     if gpu_cnt > 1:
         question_generator = DDP(question_generator, device_ids=[local_rank]).module
 
-    tokenizer = AutoTokenizer.from_pretrained(args.qg_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.qg_model_name, local_files_only=True)
 
     if enable_difficulty: # input: prompt words + difficulty
         difficulty_control_tokens = {'additional_special_tokens': ['<dif_{}>'.format(i) for i in range(4)]}
@@ -452,7 +453,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
     save_info = {
         'epoch': 0,
         'loss': 0,
-        'best_validation_performance': 0,
+        'best_validation_performance': -1,
         'model_state_dict': None,
         'optimizer_state_dict': None
     }
@@ -590,11 +591,17 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
                 save_info['model_state_dict'] = deepcopy(question_generator.state_dict())
                 save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
                 qg_evaluator.output_result(args.qg_eval_output)
-            logging.info('-- local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
     
     # save best performing model    
     if global_rank == local_rank == 0:
-        save_path = os.path.join(args.model_save_dir, 'non_adaptive_{}_{}ep.pth'.format(args.qg_model_name.replace('/', '-'), save_info['epoch'])) 
+        logging.info('-- local_rank:{}, finish training, best model: {}-th epoch, loss: {}, validation_performance: {}'.format(local_rank, save_info['epoch'], save_info['loss'], save_info['best_validation_performance']))
+        file_name = 'w_'
+        if enable_difficulty:
+            file_name += 'd_'
+        file_name += args.qg_model_name.replace('/', '-')
+        file_name += '_{}ep.pth'.format(save_info['epoch'])
+
+        save_path = os.path.join(args.model_save_dir, file_name) 
         logging.info('saving model to {}'.format(save_path))
         torch.save(save_info, save_path)
 
@@ -659,4 +666,4 @@ if __name__ == '__main__':
             logging.info('-- available gpus: {}'.format([torch.cuda.get_device_name(i) for i in range(gpu_cnt)]))
             logging.info('-- total_train_batch_size is {}, per_device_train_batch_size is {}'.format(args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
     
-    train_non_adaptive_baselines(args, gpu_cnt=gpu_cnt, local_rank=local_rank, device=device, enable_difficulty=False)
+    train_non_adaptive_baselines(args, gpu_cnt=gpu_cnt, local_rank=local_rank, device=device, enable_difficulty=True)
