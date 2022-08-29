@@ -430,10 +430,11 @@ def ascii_decode(x):
 
 
 class KTTokenizer:
-    def __init__(self, word_file, w_l_tuple_file, max_seq_len, label_pad_id=-100):
+    def __init__(self, word_file, w_l_tuple_file, max_seq_len, label_pad_id=-100, target_split=['train']):
         
         self.max_seq_len = max_seq_len
         self.label_pad_id = -100
+        self.target_split = target_split
 
         self.word_map = {}
         df_words = pd.read_csv(word_file)
@@ -477,7 +478,7 @@ class KTTokenizer:
         self.num_tasks = len(self.task_map)
 
 
-    def __call__(self, user_log, padding=True, truncation=True):
+    def __call__(self, user_log, padding=False, truncation=False):
 
         # begining token <sep>
 
@@ -503,6 +504,8 @@ class KTTokenizer:
         tokenized['split_ids'].append(self.split_pad_id)
 
         for split in ['train', 'dev', 'test']:
+            if self.target_split and split not in self.target_split:
+                continue 
             for interaction_id, interaction in enumerate(user_log[split]):
                 for idx, item in enumerate(interaction['exercise']):
                     tokenized['word_ids'].append(self.word_map.get(item['text'], self.word_unk_id))
@@ -532,12 +535,26 @@ class KTTokenizer:
             self.pad(tokenized)
             
         return tokenized
-
+    
+    def build_word_attn_mask(self, data):
+                word_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
+                for target_idx in range(batch_max_seq_len): # row
+                    # situation 1: diagnol always == 1
+                    word_attn_mask[target_idx][target_idx] = False
+                    for source_idx in range(batch_max_seq_len): # column
+                        # situation 2: words within same interaction == 1
+                        if data['word_ids'][target_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['word_ids'][source_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
+                            # for pad word, word_id = -1
+                            word_attn_mask[target_idx][source_idx] = False
+                        # situation 3: <sep> with last interaction words == 1  
+                        if data['word_ids'][target_idx] == tokenizer.word_sep_id and data['word_ids'][source_idx] != tokenizer.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
+                            word_attn_mask[target_idx][source_idx] = False
+ 
 
     def pad(self, tokenized, max_seq_len=None, max_interaction_num=None):
         max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
         
-        seq_pad_length = self.max_seq_len - len(tokenized['word_ids'])
+        seq_pad_length = max_seq_len - len(tokenized['word_ids'])
         if seq_pad_length > 0:
             tokenized['position_ids'].extend([idx for idx in range(len(tokenized['word_ids']), max_seq_len)])
             tokenized['word_ids'].extend([self.word_pad_id for i in range(seq_pad_length)])
@@ -621,18 +638,23 @@ class KTTokenizer:
 
 
 class DuolingoKTDataset(Dataset):
-    def __init__(self, data_file, tokenizer):
+    def __init__(self, data_file, tokenizer, max_lines=-1):
 
         self.tokenizer = tokenizer
 
         self.data = []
 
         with open(data_file, 'r') as fp:
-            for line in fp.readlines():
+            for idx, line in enumerate(fp.readlines()):
+                if idx >= max_lines > 0:
+                    break
                 user_log = json.loads(line.strip())
                 tokenized = self.tokenizer(user_log)
                 self.data.append(tokenized)
+    
 
+    def __getitem__(self, idx):
+        return self.data[idx]['user_ids'], self.data[idx]['user_ability'], self.data[idx]['word_ids'], self.data[idx]['word_attn_masks'], self.data[idx]['w_l_tuple_ids'], self.data[idx]['w_l_tuple_attn_masks'], self.data[idx]['position_ids'], self.data[idx]['task_ids'], self.data[idx]['interaction_ids'], self.data[idx]['sep_indices'], self.data[idx]['labels'], self.data[idx]['split_ids']
 
     def construct_collate_fn(self, tokenizer, max_seq_len=None):
         
@@ -641,6 +663,7 @@ class DuolingoKTDataset(Dataset):
 
             batch_max_seq_len = max([len(data['word_ids']) for data in batch_data])
 
+            # logging.info('-- collate, {} examples, batch_max_seq_len {}'.format(len(batch_data), batch_max_seq_len))
             if max_seq_len and max_seq_len < batch_max_seq_len:
                 batch_max_seq_len = max_seq_len
 
@@ -711,8 +734,8 @@ class DuolingoKTDataset(Dataset):
         return collate_fn
 
 
-    def __getitem__(self, idx):
-        return self.data[idx]
+    # def __getitem__(self, idx):
+    #    return self.data[idx]
 
 
     def __len__(self):

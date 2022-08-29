@@ -1,4 +1,4 @@
-import sys, json, spacy, logging, torch
+import sys, json, spacy, logging, torch, os
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
 from rouge import Rouge
 import pandas as pd
@@ -7,6 +7,7 @@ import numpy as np
 from nltk import word_tokenize
 import torch.nn.functional as F
 from process_data import ascii_decode, ascii_encode
+from tqdm import tqdm
 
 
 class QGEvaluator:
@@ -143,7 +144,7 @@ class KTEvaluator:
             'dev': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
             'test': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
         }
-
+        pbar = tqdm(total=len(self.user_ids))
         for example_id in range(total_examples):
             for sid, split in ([(1, 'train'), (2, 'dev'), (3, 'test')]):
                 split_positions = np.where(self.split_ids[example_id] ==sid, True, False) # filter other splits
@@ -164,8 +165,9 @@ class KTEvaluator:
                 collections[split]['pred_labels'].extend(pred_labels)
                 collections[split]['labels'].extend(valid_labels)
                 collections[split]['positive_probs'].extend(positive_probs)
-
-
+            pbar.update(1)
+        pbar.close()
+        
         for split in ['train', 'dev', 'test']:
             collections[split]['pred_labels'] = np.array(collections[split]['pred_labels'])
             collections[split]['labels'] = np.array(collections[split]['labels'])
@@ -185,29 +187,40 @@ class KTEvaluator:
 
     
 
-    def read(self, file_name):
-        with open(file_name, 'r') as fp:
-            for line in fp.readlines():
-                data = json.loads(line.strip())
-                self.user_ids.append(np.array(data['user_id']))
-                self.user_abilities.append(data['user_ability'])
-                self.logits.append(np.array(data['logits']))
-                self.labels.append(np.array(data['labels']))
-                self.states.append(np.array(data['states']))
-                self.split_ids.append(np.array(data['split_ids']))
+    def read(self, dir_name):
+        for file_name in os.listdir(dir_name):
+            with open(os.path.join(dir_name, file_name), 'r') as fp:
+                lines = fp.readlines()
+                for line in lines:
+                    data = json.loads(line.strip())
+                    self.user_ids.append(np.array(data['user_id']))
+                    self.user_abilities.append(np.array(data['user_ability']))
+                    self.logits.append(np.array(data['logits']))
+                    self.labels.append(np.array(data['labels']))
+                    self.states.append(np.array(data['states']))
+                    self.split_ids.append(np.array(data['split_ids']))
+        '''
+        self.user_ids = np.array(self.user_ids)
+        self.user_abilities = np.array(self.user_abilities)
+        self.logits = np.array(self.logits)
+        self.labels = np.array(self.labels)
+        self.states = np.array(self.states)
+        self.split_ids = np.array(self.split_ids)
+        '''
 
-    
     def write(self, dir_name):
-        
+        pbar = tqdm(total=len(self.user_ids))         
         for idx in range(len(self.user_ids)):
             dump = {
-                'user_id': self.user_ids[idx],
-                'user_ability': self.user_abilities[idx],
+                'user_id': self.user_ids[idx].tolist(),
+                'user_ability': self.user_abilities[idx].tolist(),
                 'logits': self.logits[idx].tolist(),
                 'labels': self.labels[idx].tolist(),
                 'states': self.states[idx].tolist(),
                 'split_ids': self.split_ids[idx].tolist()
             }
-            file_name = ascii_decode(self.user_ids[idx])
+            file_name = '-'.join(self.user_ids[idx].astype(np.str_).tolist())  # ascii_decode(self.user_ids[idx])
             with open(os.path.join(dir_name, file_name), 'w') as fp:
-                fp.write(json.dumps(file_name+'\n'))
+                fp.write(json.dumps(dump)+'\n')
+            pbar.update(1)
+        pbar.close()

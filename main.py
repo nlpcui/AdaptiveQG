@@ -1,5 +1,5 @@
 import sys, os, json, configparser, argparse, datetime, logging, math
-os.environ['CUDA_VISIBLE_DEVICES'] = '3,4,6,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
 import torch
 from tqdm import tqdm
 from process_data import *
@@ -23,6 +23,9 @@ from copy import deepcopy
 def train_kt(args, local_rank, gpu_cnt, device):
     
     # num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, alpha=0.8, emb_padding_idx=0
+    if gpu_cnt > 0:
+        args.kt_train_batch_size = args.kt_train_batch_size //  gpu_cnt
+
     tokenizer = KTTokenizer(
         word_file=args.duolingo_en_es_word_file, 
         w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
@@ -46,16 +49,17 @@ def train_kt(args, local_rank, gpu_cnt, device):
         dropout_exercise=args.kt_dropout_exercise, 
         dim_ff_interaction=args.kt_dim_ff_interaction, 
         dropout_interaction=args.kt_dropout_interaction, 
-        num_labels=args.kt_num_labels
+        num_labels=args.kt_num_labels,
+        device=device
     ).to(device)
 
     if gpu_cnt > 1:
         model = DDP(model, device_ids=[local_rank]).module
 
-    if local_rank == 0:
-        logging.info('-- Building dataset ...')
+    logging.info('-- local_rank: {}, building dataset ...'.format(local_rank))
     
-    dataset = DuolingoKTDataset(data_file=args.duolingo_en_es_format, tokenizer=tokenizer)
+    dataset = DuolingoKTDataset(data_file=args.duolingo_en_es_format, tokenizer=tokenizer, max_lines=-1)
+    logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
 
     # if local_rank == 0:
     #     for index in random.sample(range(len(dataset)), 3):
@@ -84,7 +88,7 @@ def train_kt(args, local_rank, gpu_cnt, device):
 
     batch_steps = len(dataset) // args.kt_train_batch_size // max(1, gpu_cnt)
     total_steps = batch_steps * args.kt_train_epoch
-    warmup_steps = args.kt_warmup_rate * total_steps
+    warmup_steps = int(args.kt_warmup_rate * total_steps)
 
     loss_function = nn.CrossEntropyLoss(ignore_index=args.kt_pad_label_id)
     optimizer = AdamW(model.parameters(), lr=args.kt_learning_rate)
@@ -95,9 +99,8 @@ def train_kt(args, local_rank, gpu_cnt, device):
     )
 
 
-    if local_rank == 0:
-        logging.info('-- Learning_rate: {}, total_batch_size: {}, batch_size_per_device: {}, batch_steps: {}, total_steps: {}, warmup_rate: {} warmup_steps: {}'.format(
-            args.kt_learning_rate, args.kt_train_batch_size*max(1, gpu_cnt), args.kt_train_batch_size, batch_steps, total_steps, args.kt_warmup_rate, warmup_steps
+    logging.info('-- local rank {} start training, learning_rate: {}, total_batch_size: {}, batch_size_per_device: {}, batch_steps: {}, total_steps: {}, warmup_rate: {} warmup_steps: {}'.format(
+            local_rank, args.kt_learning_rate, args.kt_train_batch_size*max(1, gpu_cnt), args.kt_train_batch_size, batch_steps, total_steps, args.kt_warmup_rate, warmup_steps
         ))
 
 
@@ -116,7 +119,9 @@ def train_kt(args, local_rank, gpu_cnt, device):
         
         kt_evaluator = KTEvaluator()
         epoch_loss = 0
-
+        
+        i_max_len = 0
+        i_max_int = 0
         # x_user_ids, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids
         for batch_id, (x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids) in enumerate(dataloader):
             logging.debug('-- local rank {}, batch data:\n x_user_ids: {},\n x_user_abilities: {},\n x_word_ids: {},\n x_w_l_tuple_ids: {},\n x_position_ids: {},\n, x_task_ids: {},\n x_interaction_ids: {},\n x_sep_indices: {},\n y_labels: {},\n split_ids: {},\n x_word_attn_masks: {},\n x_w_l_tuple_attn_masks: {},\n.'.format(local_rank, x_user_ids, x_user_abilities, x_word_ids, x_w_l_tuple_ids, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids, x_word_attn_masks, x_w_l_tuple_attn_masks))
@@ -134,23 +139,28 @@ def train_kt(args, local_rank, gpu_cnt, device):
             y_labels:          [batch_size, seq_len]
             split_ids:         [batch_size, seq_len]
             '''
-
             optimizer.zero_grad()
 
             batch_size = x_user_ids.size(0) # for last batch
             batch_seq_len = x_word_ids.size(1)
             batch_user_ids = [ascii_decode(user_id) for user_id in x_user_ids]
-
+            logging.info('local rank {}, batch_idx {}/{}'.format(local_rank, batch_id, batch_steps))
+            if i_max_len < batch_seq_len:
+                i_max_len = batch_seq_len
+            if i_max_int < x_sep_indices.size(1):
+                i_max_int = x_sep_indices.size(1)
+            continue
+            # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
             # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
             x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
                 batch_size * args.kt_num_attn_heads_interaction, 
+                batch_seq_len,
                 batch_seq_len, 
-                -1
             )
             x_word_attn_masks = x_word_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_exercise, 1, 1).view(
                 batch_size * args.kt_num_attn_heads_exercise, 
                 batch_seq_len, 
-                -1
+                batch_seq_len, 
             )
 
             logits, memory_states = model(
@@ -170,12 +180,14 @@ def train_kt(args, local_rank, gpu_cnt, device):
             split_ids_ = split_ids.view(batch_size*batch_seq_len, )
 
 
-            y_labels_train = torch.where(split_ids_==3, y_labels_, -100)
+            y_labels_train = torch.where(split_ids_==1, y_labels_, -100)
 
             valid_train_examples = torch.where(y_labels_train>=0, True, False).sum()
+            total_valid_steps = torch.where(y_labels_>=0, True, False).sum()
+            logging.debug('-- rank {}, batch_seq_len {}, valid_train_steps {}, total steps {}'.format(local_rank, batch_seq_len, valid_train_examples, total_valid_steps))
             if valid_train_examples < 0.5 * batch_size * batch_seq_len:
-                logging.warning('-- In {}/{} epoch, {}/{} batch, user_ids {}, no enough data for train, total steps: {}, valid train steps:{}, discard!'.format(
-                    epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, batch_size * batch_seq_len, valid_train_examples
+                logging.warning('-- Rank {}, in {}/{} epoch, {}/{} batch, user_ids {}, no enough data for train, total steps: {}, valid train steps:{}, discard!'.format(
+                    local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, total_valid_steps, valid_train_examples
                 ))
                 continue 
 
@@ -187,7 +199,12 @@ def train_kt(args, local_rank, gpu_cnt, device):
             lr_scheduler.step()
             
             logging.info('-- local_rank: {} In {}/{} epoch, {}/{} batch, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, loss))
-
+            ''' 
+            word_pad_length = int(args.kt_max_seq_length) - batch_seq_len
+            if pad_length > 0:
+                output_ids = F.pad(output_ids, pad=(0, pad_length), value=-1) 
+            '''
+            dist.all_gather()
             # collect evaluation data
             kt_evaluator.user_ids.extend(x_user_ids.numpy())
             kt_evaluator.user_abilities.extend(x_user_abilities.numpy())
@@ -195,27 +212,33 @@ def train_kt(args, local_rank, gpu_cnt, device):
             kt_evaluator.labels.extend(y_labels.detach().cpu().numpy())
             kt_evaluator.split_ids.extend(split_ids.detach().cpu().numpy())
             kt_evaluator.states.extend(memory_states.detach().cpu().numpy())
-
+        
+        logging.info('-- rank {} max_seq {}, max_int {}'.format(local_rank, i_max_len, i_max_int))
         logging.info('-- local rank {} finished {}/{} epoch'.format(local_rank, epoch_id, args.kt_train_epoch))
-
+        exit(1)
         ## epoch evaluation
         if gpu_cnt > 1:
+            logging.info('rank {} is writing output ...'.format(local_rank))
             kt_evaluator.write(args.kt_epoch_results_dir)
+            logging.info('rank {} finished writing output!'.format(local_rank))
             dist.barrier() # ensure all processes finish epoch training and write down results
-
             if local_rank == 0:
+                logging.info('-- all processes finished {} epoch, eval by rank 0'.format(epoch_id))
                 kt_evaluator = KTEvaluator()
                 # collect results of all processes
-                for file_name in os.listdir(args.kt_eval_results_dir):
-                    kt_evaluator.read(os.path.join(args.kt_epoch_results_dir, file_name))
-                
+                logging.info('reading output of all processes ...')
+                kt_evaluator.read(args.kt_epoch_results_dir)
+                logging.info('collected {} data for evaluation, computing metrics'.format(len(kt_evaluator.user_ids))) 
                 performance = kt_evaluator.compute_metrics()
-                if performance['dev']['roc'] > save_info['best_validation_performance']:
+                if performance['train']['roc'] > save_info['best_validation_performance']:
                     save_info['epoch'] = epoch_id
                     save_info['loss'] = epoch_loss
-                    save_info['best_validation_performance'] = performance['dev']['roc']
+                    save_info['best_validation_performance'] = performance['train']['roc']
                     save_info['model_state_dict'] = deepcopy(model.state_dict())
                     save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
+                    
+                    logging.info('saving best output to {}'.format(args.kt_best_epoch_dir)) 
+                    kt_evaluator.write(args.kt_best_epoch_dir)
                 logging.info('-- {}/{} epoch, kt_performance: {}'.format(epoch_id, args.kt_train_epoch, performance))
 
             dist.barrier() # ensure other processes not go into next epoch to change result
@@ -223,16 +246,15 @@ def train_kt(args, local_rank, gpu_cnt, device):
             performance = kt_evaluator.compute_metrics()
             logging.info('-- {}/{} epoch, kt_performance: {}'.format(epoch_id, args.kt_train_epoch, performance))
 
-            if performance['dev']['roc'] > save_info['best_validation_performance']:
+            if performance['train']['roc'] > save_info['best_validation_performance']:
                 save_info['epoch'] = epoch_id
                 save_info['loss'] = epoch_loss
-                save_info['best_validation_performance'] = performance['dev']['roc']
+                save_info['best_validation_performance'] = performance['train']['roc']
                 save_info['model_state_dict'] = deepcopy(model.state_dict())
                 save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
 
                 kt_evaluator.write(args.kt_best_epoch_dir)
         ## end epoch evaluation
-
 
     logging.info('-- local rank {} finished training'.format(local_rank))
 
@@ -470,6 +492,9 @@ def train_adaptive_qg(args, gpu_cnt, global_rank, local_rank, device, model_name
 
 
 def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_difficulty):
+    
+    args.qg_train_batch_size = int(args.qg_train_batch_size) // max(1, gpu_cnt)
+    args.qg_eval_batch_size = int(args.qg_eval_batch_size) // max(1, gpu_cnt)
 
     # baseline options: Bart, T-5, 
     # config = AutoConfig.from_pretrained(args.qg_model_name)
@@ -744,7 +769,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='local_conf.ini')
+    parser.add_argument('--conf', type=str, default='euler_conf.ini')
      
     args, remaining_argv = parser.parse_known_args()
     config = configparser.ConfigParser()
@@ -762,7 +787,7 @@ if __name__ == '__main__':
     logging.basicConfig(
         format='%(asctime)s %(message)s', 
         datefmt='%Y-%d-%m %I:%M:%S %p', 
-        # filename=args.duolingo_en_es_kt_train_log, 
+        filename=args.kt_train_log, 
         level=logging.INFO, 
         filemode='a'
     )
@@ -786,13 +811,12 @@ if __name__ == '__main__':
         dist.init_process_group('nccl', init_method='env://', world_size=gpu_cnt, rank=local_rank)
         # global_rank = dist.get_rank() # process_id
         
-        args.qg_train_batch_size = int(args.qg_train_batch_size) // gpu_cnt
-        args.qg_eval_batch_size = int(args.qg_eval_batch_size) // gpu_cnt
         
         if local_rank == 0:
             logging.info('cuda visible devices {}'.format(os.environ["CUDA_VISIBLE_DEVICES"]))
             logging.info('-- available gpus: {}'.format([torch.cuda.get_device_name(i) for i in range(gpu_cnt)]))
-            logging.info('-- total_train_batch_size is {}, per_device_train_batch_size is {}'.format(args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
+            
+            # logging.info('-- total_train_batch_size is {}, per_device_train_batch_size is {}'.format(args.qg_train_batch_size*gpu_cnt, args.qg_train_batch_size)) 
     
     # train_non_adaptive_baselines(args, gpu_cnt=gpu_cnt, local_rank=local_rank, device=device, enable_difficulty=True)
 

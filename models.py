@@ -7,7 +7,7 @@ import numpy as np
 
 
 class PostionalEncoding(nn.Module):
-    def __init__(self, d_model, max_seq_len=5000):
+    def __init__(self, d_model, device='cpu', max_seq_len=5000):
         """
         constructor of sinusoid encoding class
         :param d_model: dimension of model
@@ -15,12 +15,12 @@ class PostionalEncoding(nn.Module):
         """
         super(PostionalEncoding, self).__init__()
 
-        self.encoding = torch.zeros(max_seq_len, d_model, requires_grad=False)
+        self.encoding = torch.zeros(max_seq_len, d_model, requires_grad=False, device=device)
 
-        position = torch.arange(0, max_seq_len).float().unsqueeze(dim=1)
+        position = torch.arange(0, max_seq_len, device=device).float().unsqueeze(dim=1)
         # 1D => 2D unsqueeze to represent word's position
 
-        _2i = torch.arange(0, d_model, step=2).float()
+        _2i = torch.arange(0, d_model, step=2, device=device).float()
 
         self.encoding[:, 0::2] = torch.sin(position / (10000 ** (_2i / d_model)))
         self.encoding[:, 1::2] = torch.cos(position / (10000 ** (_2i / d_model)))
@@ -56,15 +56,16 @@ class TransformerEncodingBlock(nn.Module):
 
 
 class KnowledgeTracer(nn.Module):
-    def __init__(self, num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, num_labels=2, alpha=0.8, emb_padding_idx=0):
+    def __init__(self, num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, device='cpu', num_labels=2, alpha=0.8, emb_padding_idx=0):
         super(KnowledgeTracer, self).__init__()
         
         self.alpha = alpha
+        self.device = device
 
         self.word_embeddings = nn.Embedding(num_words, dim_emb, padding_idx=emb_padding_idx)
         self.w_l_tuple_embeddings = nn.Embedding(num_w_l_tuples, dim_emb, padding_idx=emb_padding_idx) 
 
-        self.positional_embeddings = PostionalEncoding(dim_emb, max_seq_len=max_seq_len)
+        self.positional_embeddings = PostionalEncoding(dim_emb, max_seq_len=max_seq_len, device=device)
         self.task_embeddings = nn.Embedding(num_tasks, dim_emb, padding_idx=emb_padding_idx)
         
         self.word_encoder = nn.ModuleList([
@@ -101,12 +102,15 @@ class KnowledgeTracer(nn.Module):
         '''
 
         batch_size = x_word_ids.size(0)
-
         pos_embs = self.positional_embeddings(x_word_ids)
         task_embs = self.task_embeddings(x_task_ids)
 
-        word_embs = self.word_embeddings(x_word_ids) + task_embs + pos_embs
-        w_l_tuple_embs = self.w_l_tuple_embeddings(x_w_l_tuple_ids) + task_embs + pos_embs
+        word_embs = self.word_embeddings(x_word_ids) 
+        w_l_tuple_embs = self.w_l_tuple_embeddings(x_w_l_tuple_ids) 
+        
+
+        w_l_tuple_embs = w_l_tuple_embs + task_embs + pos_embs
+        word_embs = word_embs + task_embs + pos_embs
 
         h_word_state = word_embs
         for layer_id, word_encoding_layer in enumerate(self.word_encoder):
@@ -124,13 +128,11 @@ class KnowledgeTracer(nn.Module):
 
         memory_states = h_cross_state[torch.arange(0, batch_size).unsqueeze(-1), x_sep_indices] # [batch_size, num_interactions, hidden_size]
         
-        logging.info('-- memory states shape {}'.format(memory_states.shape))
-
         memory_states_pos = self.ff_output_memory_pos_2(nn.functional.tanh(self.ff_output_memory_pos_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
         memory_states_neg = self.ff_output_memory_neg_2(nn.functional.tanh(self.ff_output_memory_neg_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
         memory_states = torch.cat([memory_states_pos, memory_states_neg], dim=-1) # [batch_size, num_interactions, num_words, 2]
 
-        x_memory_update_triu = torch.triu(torch.ones(x_sep_indices.size(1), x_sep_indices.size(1)), diagonal=0) # [num_interactions, num_interactions]
+        x_memory_update_triu = torch.triu(torch.ones(x_sep_indices.size(1), x_sep_indices.size(1)), diagonal=0).to(self.device) # [num_interactions, num_interactions]
         memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_triu).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
 
         batch_idx = torch.arange(0, batch_size).unsqueeze(-1) # unsqueeze for broadcast
