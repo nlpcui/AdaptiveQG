@@ -1,5 +1,4 @@
-import torch
-import transformers
+import torch, math, transformers, logging
 import torch.nn as nn
 import torch.nn.functional as F
 # from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
@@ -7,26 +6,29 @@ from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2Se
 import numpy as np
 
 
-class PositionalEncoding(nn.Module):
-    # Transformer PE
-    def __init__(self, d_model, dropout, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
+class PostionalEncoding(nn.Module):
+    def __init__(self, d_model, max_seq_len=5000):
+        """
+        constructor of sinusoid encoding class
+        :param d_model: dimension of model
+        :param max_seq_len: max sequence length
+        """
+        super(PostionalEncoding, self).__init__()
 
-        # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) *
-                             -(math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        self.encoding = torch.zeros(max_seq_len, d_model, requires_grad=False)
 
+        position = torch.arange(0, max_seq_len).float().unsqueeze(dim=1)
+        # 1D => 2D unsqueeze to represent word's position
+
+        _2i = torch.arange(0, d_model, step=2).float()
+
+        self.encoding[:, 0::2] = torch.sin(position / (10000 ** (_2i / d_model)))
+        self.encoding[:, 1::2] = torch.cos(position / (10000 ** (_2i / d_model)))
+        # compute positional encoding to consider positional information of words
 
     def forward(self, x):
-        x = x + Variable(self.pe[:, :x.size(1)],requires_grad=False)
-        return self.dropout(x)
+        # x: [batch_size, seq_len]
+        return self.encoding[:x.size(1), :]
 
 
 class TransformerEncodingBlock(nn.Module):
@@ -39,6 +41,7 @@ class TransformerEncodingBlock(nn.Module):
         self.dropout_2 = nn.Dropout(dropout)
         self.relu = nn.ReLU()
         self.layer_norm = nn.LayerNorm(dim_attn)
+
 
     def forward(self, query, key, value, attn_mask):
         attn_output, attn_output_weights = self.multihead_attn(query, key, value, attn_mask=attn_mask) # multi-head attn
@@ -53,61 +56,89 @@ class TransformerEncodingBlock(nn.Module):
 
 
 class KnowledgeTracer(nn.Module):
-    def __init__(self, num_emb, dim_emb, max_len, dim_pe, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, num_label):
-        super(SAKT, self).__init__()
-        self.embeddings = nn.Embedding(num_emb, dim_emb) # |formats|+|students|+|words|+|interactions|+|pad|+|unk|
-        self.positional_embedding = nn.Embedding(max_len, dim_pe)
-        # self.temporal_embedding = nn.Embedding(num_time, dim_te)
-        # self.memory_key = nn.Embedding(num_words)
+    def __init__(self, num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, num_labels=2, alpha=0.8, emb_padding_idx=0):
+        super(KnowledgeTracer, self).__init__()
         
-        self.exercise_encoder = nn.ModuleList([
+        self.alpha = alpha
+
+        self.word_embeddings = nn.Embedding(num_words, dim_emb, padding_idx=emb_padding_idx)
+        self.w_l_tuple_embeddings = nn.Embedding(num_w_l_tuples, dim_emb, padding_idx=emb_padding_idx) 
+
+        self.positional_embeddings = PostionalEncoding(dim_emb, max_seq_len=max_seq_len)
+        self.task_embeddings = nn.Embedding(num_tasks, dim_emb, padding_idx=emb_padding_idx)
+        
+        self.word_encoder = nn.ModuleList([
             TransformerEncodingBlock(dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise) for i in range(num_exercise_encoder_layers)
-        ]) # encode <word, label> sequence
-        self.interaction_encoder = nn.ModuleList([
+        ]) # self-attention in words
+        self.w_l_tuple_encoder = nn.ModuleList([
             TransformerEncodingBlock(dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction) for i in range(num_interaction_encoder_layers)
-        ]) # encode <word> sequence
+        ]) # self-attention in (word, label) tuples
 
-        self.ff_output = nn.Linear(dim_attn_interaction, num_label, bias=True) 
+        self.cross_encoder = nn.ModuleList([
+            TransformerEncodingBlock(dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise) for i in range(num_exercise_encoder_layers)
+        ]) # cross-attention (query=word, key,value=tuples)
 
-    
-    def forward(self, x_exercise, x_interaction, x_exercise_attn_mask, x_interaction_attn_mask, y_labels):
-        # x_exercise: [batch_size, max_seq_len]
-        # x_interaction: [batch_size, max_seq_len]
-        # x_exercise_attn_mask: [batch_size, max_seq_len, max_seq_len]
-        # x_interaction_attn_mask: [batch_size, max_seq_len, max_seq_len]
-        # y_labels: [batch_size, seq_len]
-
-        exercise_emb_seq = self.embeddings(x_exercise)
-        interaction_emb_seq = self.embeddings(x_interaction)
+        self.ff_output_context_1 = nn.Linear(dim_attn_interaction, 2*dim_attn_interaction, bias=True)
+        self.ff_output_context_2 = nn.Linear(2*dim_attn_interaction, num_labels, bias=True)
         
-        # positional_embs = self.positional_embedding(x_token)
-        # temporal_embs = self.temporal_embedding(x_token)
-        # token_emb = token_emb + temporal_emb + positional_emb
-        # token_label_emb = token_label_emb + temporal_emb + positional_emb
+        self.ff_output_memory_pos_1 = nn.Linear(dim_attn_interaction, 2*num_words, bias=True)
+        self.ff_output_memory_pos_2 = nn.Linear(2*num_words, num_words, bias=True)
 
-        # encoding exercise context
-        encoded_exercise = exercise_emb_seq
-        for layer_id, exercise_encoder_layer in enumerate(self.exercise_encoder):
-            # print(layer_id, encoded_exercise.shape)
-            encoded_exercise, attn_weight_exercise = exercise_encoder_layer(
-                query=encoded_exercise,
-                key=encoded_exercise,
-                value=encoded_exercise,
-                attn_mask=x_exercise_attn_mask # only words in the same exercise are attended
-            )
-        # encoding history interaction
-        for layer_id, interaction_encoder_layer in enumerate(self.interaction_encoder):
-            # print(layer_id, encoded_exercise.shape)
-            encoded_exercise, attn_weight_exercise = interaction_encoder_layer(
-                query=encoded_exercise,
-                key=interaction_emb_seq,
-                value=interaction_emb_seq,
-                attn_mask=x_interaction_attn_mask # only words in the same exercise are attended
-            )
+        self.ff_output_memory_neg_1 = nn.Linear(dim_attn_interaction, 2*num_words, bias=True)
+        self.ff_output_memory_neg_2 = nn.Linear(2*num_words, num_words, bias=True)
+
+
+    def forward(self, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices):
+        '''
+        x_word_ids:                 [batch_size, seq_len]
+        x_w_l_tuple_ids:            [batch_size, seq_len]
+        x_position_ids:             [batch_size, seq_len]
+        x_task_ids:                 [batch_size, seq_len]
+        x_exercise_attn_mask:       [batch_size*attn_heads, seq_len, seq_len]
+        x_interaction_attn_mask:    [batch_size*attn_heads, seq_len, seq_len]
+        x_interaction_ids:          [batch_size, seq_len]
+        x_sep_indices:              [batch_size*attn_heads, num_interactions]
+        '''
+
+        batch_size = x_word_ids.size(0)
+
+        pos_embs = self.positional_embeddings(x_word_ids)
+        task_embs = self.task_embeddings(x_task_ids)
+
+        word_embs = self.word_embeddings(x_word_ids) + task_embs + pos_embs
+        w_l_tuple_embs = self.w_l_tuple_embeddings(x_w_l_tuple_ids) + task_embs + pos_embs
+
+        h_word_state = word_embs
+        for layer_id, word_encoding_layer in enumerate(self.word_encoder):
+            h_word_state, cross_attn_weights = word_encoding_layer(query=h_word_state, key=h_word_state, value=h_word_state, attn_mask=x_word_attn_masks)
         
-        logits = self.ff_output(encoded_exercise) # [batch_size, seq_len, num_label] 
+        h_w_l_tuple_state = w_l_tuple_embs
+        for layer_id, w_l_tuple_encoding_layer in enumerate(self.w_l_tuple_encoder):
+            h_w_l_tuple_state, cross_attn_weights = w_l_tuple_encoding_layer(query=h_w_l_tuple_state, key=h_w_l_tuple_state, value=h_w_l_tuple_state, attn_mask=x_w_l_tuple_attn_masks)
+        
+        h_cross_state = h_word_state
+        for layer_id, cross_encoding_layer in enumerate(self.cross_encoder):
+            h_cross_state, cross_attn_weights = cross_encoding_layer(query=h_cross_state, key=h_w_l_tuple_state, value=h_w_l_tuple_state, attn_mask=x_w_l_tuple_attn_masks)
 
-        return logits
+        logits_context = self.ff_output_context_2(nn.functional.tanh(self.ff_output_context_1(h_cross_state))) # [batch_size, max_seq_len, 2]
+
+        memory_states = h_cross_state[torch.arange(0, batch_size).unsqueeze(-1), x_sep_indices] # [batch_size, num_interactions, hidden_size]
+        
+        logging.info('-- memory states shape {}'.format(memory_states.shape))
+
+        memory_states_pos = self.ff_output_memory_pos_2(nn.functional.tanh(self.ff_output_memory_pos_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
+        memory_states_neg = self.ff_output_memory_neg_2(nn.functional.tanh(self.ff_output_memory_neg_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
+        memory_states = torch.cat([memory_states_pos, memory_states_neg], dim=-1) # [batch_size, num_interactions, num_words, 2]
+
+        x_memory_update_triu = torch.triu(torch.ones(x_sep_indices.size(1), x_sep_indices.size(1)), diagonal=0) # [num_interactions, num_interactions]
+        memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_triu).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
+
+        batch_idx = torch.arange(0, batch_size).unsqueeze(-1) # unsqueeze for broadcast
+        logits_memory = memory_states[batch_idx, x_interaction_ids, x_word_ids] # [batch_size, max_seq_len, 2] 
+        
+        logits = self.alpha * logits_memory + (1 - self.alpha) * logits_context # [batch_size, max_seq_len, 2]
+
+        return logits, memory_states
 
 
 
@@ -169,4 +200,3 @@ class NonAdaptiveQuestionGenerator(nn.Module):
 
 
 ## GPT2
-

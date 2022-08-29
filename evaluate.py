@@ -5,6 +5,9 @@ import pandas as pd
 from nltk.translate.bleu_score import sentence_bleu
 import numpy as np
 from nltk import word_tokenize
+import torch.nn.functional as F
+from process_data import ascii_decode, ascii_encode
+
 
 class QGEvaluator:
     def __init__(self, word_file, prompt_words, generated, reference, difficulty_scores, difficulty_levels):
@@ -112,32 +115,76 @@ class QGEvaluator:
         
 
 class KTEvaluator:
-    def __init__(self, logits, labels):
+    def __init__(self, user_ids=[], user_abilities=[], logits=[], labels=[], states=[], split_ids=[], label_pad_id=-100):
+        self.user_ids = user_ids
+        self.user_abilities = user_abilities
         self.logits = logits
         self.labels = labels
+        self.states = states
+        self.split_ids = split_ids
+        self.label_pad_id = label_pad_id
     
-    def compute_metrics(logits, y_labels):
-        # cacuclate ROC and F1 score
-        # logits: [example_num, label_num]
+
+    def compute_metrics(self):
+        # ROC and F1 score
+        # logits: [example_num, label_num(2)]
         # labels: [example_num, ]
 
-        valid_positions = self.labels.ge(0)
-        
-        # binary score
-        pred_labels = torch.argmax(self.logits, dim=-1)
-        pred_labels_selected = torch.masked_select(pred_labels, valid_positions).numpy()
-        labels_selected = torch.masked_select(self.labels, valid_positions).numpy()
-        
-        f1 = f1_score(y_true=labels_selected, y_pred=pred_labels_selected)
-        precision = precision_score(y_true=labels_selected, y_pred=pred_labels_selected)
-        recall = recall_score(y_true=labels_selected, y_pred=pred_labels_selected)
-        accuracy = accuracy_score(y_true=labels_selected, y_pred=pred_labels_selected)
-        
-        pos_probs = nn.functional.softmax(self.logits, dim=-1)[:,1]
-        pos_probs_selected = torch.masked_select(pos_probs, valid_positions).numpy()
+        results = {
+            'train': {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}, 
+            'dev':  {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}, 
+            'test':  {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}
+        }
 
-        auc = roc_auc_score(y_true=labels_selected, y_score=pos_probs_selected)
+        total_examples = len(self.user_ids)
+        
+        print('split_ids', self.split_ids)
+        print('logits', self.logits)
+        print('labels', self.labels)
 
-        return {'auc': round(auc, 4), 'precision': round(precision, 4), 'recall': round(recall, 4), 'f1': round(f1, 4), 'acc': round(accuracy, 4)}
+        for sid, split in ([(1, 'train'), (2, 'dev'), (3, 'test')]):
+            valid_positions = np.where(self.split_ids==sid, True, False) # filter pad positions and other splits
+            if not valid_positions.any():
+                continue # no such split data
+            valid_logits = self.logits[valid_positions] # flat
+            valid_labels = self.labels[valid_positions] # flat
+            
+            pred_labels = np.argmax(valid_logits, axis=-1)
+            positive_probs = F.softmax(torch.tensor(valid_logits), dim=-1)[:1].numpy()
+
+            results[split]['roc'] = roc_auc_score(y_true=valid_labels, y_score=positive_probs)
+            results[split]['f1_score'] = f1_score(y_true=valid_labels, y_pred=pred_labels)
+            results[split]['precision'] = precision(y_true=valid_labels, y_pred=pred_labels)
+            results[split]['recall'] = precision(y_true=valid_labels, y_pred=pred_labels)
+            results[split]['accuarcy'] = accuracy_score(y_true=valid_labels, y_pred=pred_labels)
+
+        return results
 
     
+
+    def read(self, file_name):
+        with open(file_name, 'r') as fp:
+            for line in fp.readlines():
+                data = json.loads(line.strip())
+                self.user_ids.append(np.array(data['user_id']))
+                self.user_abilities.append(data['user_ability'])
+                self.logits.append(np.array(data['logits']))
+                self.labels.append(np.array(data['labels']))
+                self.states.append(np.array(data['states']))
+                self.split_ids.append(np.array(data['split_ids']))
+
+    
+    def write(self, dir_name):
+        
+        for idx in range(len(self.user_ids)):
+            dump = {
+                'user_id': self.user_ids[idx],
+                'user_ability': self.user_abilities[idx],
+                'logits': self.logits[idx].tolist(),
+                'labels': self.labels[idx].tolist(),
+                'states': self.states[idx].tolist(),
+                'split_ids': self.split_ids[idx].tolist()
+            }
+            file_name = ascii_decode(self.user[idx])
+            with open(os.path.join(dir_name, file_name), 'w') as fp:
+                fp.write(json.dumps(file_name+'\n'))

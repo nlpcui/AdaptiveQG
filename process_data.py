@@ -1,4 +1,4 @@
-import sys, os, re, json, random
+import sys, os, re, json, random, collections
 import copy, torch, argparse, configparser, logging, csv, math
 from torch.utils.data import Dataset
 from typing import List, Dict
@@ -8,7 +8,7 @@ import pandas as pd
 from decimal import Decimal
 from nltk import word_tokenize
 from transformers import AutoModelForSeq2SeqLM, BartTokenizer, AutoConfig, AutoTokenizer
-
+from pprint import pprint
 
 
 class InteractionLog:
@@ -78,14 +78,33 @@ class ExerciseItem:
 
 
 
-def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, format_output, vocab_file, word_file, exercise_file, non_adaptive_gen_file, build_kt=True, build_gen=True, un_cased=True):
+def auto_convert(x):
+    try:
+        float_x = float(x)
+    except Exception:
+        float_x = None
+    
+    try:
+        int_x = int(x)
+    except Exception:
+        int_x = None
+    
+    if int_x is not None and int_x == float_x:
+        return int_x
+    elif float_x is not None and int_x != float_x:
+        return float_x
+    else:
+        return x
+        
+
+
+def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, format_output, word_file, w_l_tuple_file, exercise_file, non_adaptive_gen_file, build_kt=True, build_gen_non_adaptive=True, un_cased=True):
     '''
     Input:
     train_raw: train_set (txt)
     dev_raw, dev_key_raw: dev_set (txt)
     test_raw, test_raw_key: test_set (txt)
     Output:
-    vocab_file: words + <word,label> pairs + 
     word_file: word statistics
     exercise_file: exercise statistics
     '''
@@ -93,20 +112,21 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
         return
     
     user_interactions = {}
-    vocab = {
-        '<sep>': 0,
-        '<pad>': 1,
-        '<unk>': 2,
-        '<listen>': 3,
-        '<reverse_translate>': 4,
-        '<reverse_tap>': 5
-    }
-    word_map = {} # word, freq, correct_cnt, error_cnt 
+    word_map = {
+        '<pad>': {'word': '<pad>', 'word_id': 0, 'cnt': 0, 'error_cnt': 0},
+        '<sep>': {'word': '<sep>', 'word_id': 1, 'cnt': 0, 'error_cnt': 0},
+        '<unk>': {'word': '<unk>', 'word_id': 2, 'cnt': 0, 'error_cnt': 0},
+    } 
+    w_l_tuple_map = {
+        '<pad>': {'w_l_tuple': '<pad>', 'w_l_tuple_id': 0, 'cnt': 0},
+        '<sep>': {'w_l_tuple': '<sep>', 'w_l_tuple_id': 1, 'cnt': 0},
+        '<unk>': {'w_l_tuple': '<unk>', 'w_l_tuple_id': 2, 'cnt': 0},
+    } # w_l_tuple, id, freq
     exercise_map = {} # exercise, freq, correct_cnt, error_cnt, average_num_errors
 
     # read train
     logging.info('-- reading train data...')
-    train_num = parse_lines(train_raw, user_interactions, 'train', vocab, word_map, exercise_map, label_dict=None, un_cased=un_cased)
+    train_num = parse_lines(train_raw, user_interactions, 'train', word_map, w_l_tuple_map, exercise_map, label_dict=None, un_cased=un_cased)
     logging.info('-- {} training interactions'.format(train_num))
 
     # read dev
@@ -116,7 +136,7 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
         for line in fp.readlines():
             item_id, label = line.strip().split(' ')
             dev_keys[item_id] = int(label)
-    dev_num = parse_lines(dev_raw, user_interactions, 'dev', vocab, word_map, exercise_map, label_dict=dev_keys, un_cased=un_cased)
+    dev_num = parse_lines(dev_raw, user_interactions, 'dev', word_map, w_l_tuple_map, exercise_map, label_dict=dev_keys, un_cased=un_cased)
     logging.info('--{} dev interactions'.format(dev_num))
 
     # read test 
@@ -126,40 +146,53 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
         for line in fp.readlines():
             item_id, label = line.strip().split(' ')
             test_keys[item_id] = int(label)
-    test_num = parse_lines(test_raw, user_interactions, 'test', vocab, word_map, exercise_map, label_dict=test_keys, un_cased=un_cased)
+    test_num = parse_lines(test_raw, user_interactions, 'test', word_map, w_l_tuple_map, exercise_map, label_dict=test_keys, un_cased=un_cased)
     logging.info('-- {} test interactions'.format(test_num))
-
-    logging.info('-- saving vocab to {}'.format(vocab_file))
-    vocab_table = [{
-        'token': item[0],
-        'token_id': item[1]
-    } for item in vocab.items()]
-    df = pd.DataFrame(vocab_table, columns=['token', 'token_id'])
-    df.to_csv(vocab_file, index=False)
     
     logging.info('-- saving words to {}'.format(word_file))
     for word in word_map:
-        word_map[word]['error_rate'] = word_map[word]['error_cnt'] / word_map[word]['cnt']
-    df = pd.DataFrame(word_map.values(), columns=['word', 'cnt', 'error_cnt', 'error_rate'])
+        word_map[word]['error_rate'] = word_map[word]['error_cnt'] / word_map[word]['cnt'] if word_map[word]['cnt'] > 0 else 0.
+    df = pd.DataFrame(word_map.values(), columns=['word', 'word_id', 'cnt', 'error_cnt', 'error_rate'])
     df.to_csv(word_file, index=False)
     
-    logging.info('saving exercies to {}'.format(exercise_file))
+    logging.info('-- saving w_l_tuples to {}'.format(w_l_tuple_file))
+    df = pd.DataFrame(w_l_tuple_map.values(), columns=['w_l_tuple', 'w_l_tuple_id', 'cnt'])
+    df.to_csv(w_l_tuple_file, index=False)
 
+    logging.info('-- saving exercies to {}'.format(exercise_file))
     for exercise in exercise_map:
         exercise_map[exercise]['exercise_error_rate'] = exercise_map[exercise]['exercise_error_cnt'] / exercise_map[exercise]['cnt']
         exercise_map[exercise]['avg_word_error_cnt'] = exercise_map[exercise]['word_error_cnt'] / exercise_map[exercise]['cnt']
         exercise_map[exercise]['sum_word_error_rate'] = sum([word_map[word]['error_rate'] for word in exercise.split('#')])
 
-
-
     df = pd.DataFrame(exercise_map.values(), columns=['exercise', 'cnt', 'exercise_error_cnt', 'word_error_cnt', 'exercise_error_rate', 'avg_word_error_cnt', 'sum_word_error_rate'])
     df.to_csv(exercise_file, index=False)
+
+    ## compute user_ability -- correct_rate*ave_difficulty
+    for user in user_interactions:
+        correct_rate = 0
+        difficulty_score = 0
+
+        total_cnt = 0
+        
+        for split in ['train', 'dev', 'test']:
+            total_cnt += len(user_interactions[user][split])
+            for interaction in user_interactions[user][split]:
+                for item in interaction.exercise:
+                    difficulty_score += word_map[item.text]['error_rate']
+                    correct_rate += item.label
+        
+        difficulty_score /= total_cnt
+        correct_rate /= total_cnt
+
+        user_interactions[user]['user_ability'] = difficulty_score * correct_rate
 
     ## format data for knowledge tracing
     '''
     format_output: combine train/dev/test in a jsonl file like:
     {
-        'user': 'XEinXf5+',
+        'user_id': 'XEinXf5+',
+        'user_ability': 0.7
         'country': 'CO',
         'train': [{
                 'prompt': 'Yo soy un niño.',
@@ -188,7 +221,8 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
             for user in user_interactions:
                 interaction = user_interactions[user]['train'][0]
                 output_line = json.dumps({
-                    'user': user,
+                    'user_id': user,
+                    'user_ability': user_interactions[user]['user_ability'],
                     'countries': user_interactions[user]['countries'],
                     'train': [interaction.to_dict() for interaction in user_interactions[user]['train']],
                     'dev': [interaction.to_dict() for interaction in user_interactions[user]['dev']],
@@ -197,7 +231,7 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
                 fp.write(output_line+'\n')
 
     ## construct exercises for non-adaptive generation 8:1:1
-    if build_gen:
+    if build_gen_non_adaptive:
         logging.info('-- saving non-adaptive generation dataset to {}.*.jsonl'.format(non_adaptive_gen_file))
         exercise_for_gen = {}
         for user in user_interactions:
@@ -223,7 +257,7 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
 
     
 
-def parse_lines(data_file, user_interactions, split, vocab, word_map, exercise_map, label_dict=None, un_cased=True):
+def parse_lines(data_file, user_interactions, split, word_map, w_l_tuple_map, exercise_map, label_dict=None, un_cased=True):
     fp = open(data_file, 'r')
     
     update_cnt = 0
@@ -238,7 +272,7 @@ def parse_lines(data_file, user_interactions, split, vocab, word_map, exercise_m
             if interaction_log.user not in user_interactions:
                 assert split == 'train'
                 user_interactions[interaction_log.user] = {
-                    'user': interaction_log.user,
+                    'user_id': interaction_log.user,
                     'countries': interaction_log.countries,
                     'train': [],
                     'dev': [],
@@ -246,7 +280,7 @@ def parse_lines(data_file, user_interactions, split, vocab, word_map, exercise_m
                 }
             user_interactions[interaction_log.user][split].append(interaction_log)
             
-            ## update exercise
+            ## update exercise_map
             exercise_text = '#'.join([item.text for item in interaction_log.exercise])
             error_word_cnt = sum([item.label for item in interaction_log.exercise])
             if exercise_text not in exercise_map:
@@ -270,18 +304,15 @@ def parse_lines(data_file, user_interactions, split, vocab, word_map, exercise_m
 
             ## update word_map
             if exercise_item.text not in word_map:
-                word_map[exercise_item.text] = {'word': exercise_item.text, 'cnt': 0, 'error_cnt': 0} # cnt, wrong_cnt
+                word_map[exercise_item.text] = {'word': exercise_item.text, 'word_id': len(word_map), 'cnt': 0, 'error_cnt': 0} # cnt, wrong_cnt
             word_map[exercise_item.text]['cnt'] += 1
-            word_map[exercise_item.text]['error_cnt'] += exercise_item.label  
+            word_map[exercise_item.text]['error_cnt'] += exercise_item.label
 
-            # update vocabulary
-            if split == 'train' or split == 'dev':
-                ## update vocab
-                if  'w#{}'.format(exercise_item.text) not in vocab:
-                    vocab['w#{}'.format(exercise_item.text)] = len(vocab)
-
-                if 'i#{}|{}'.format(exercise_item.text, exercise_item.label) not in vocab:
-                    vocab['i#{}|{}'.format(exercise_item.text, exercise_item.label)] = len(vocab) # id, cnt
+            ## update w_l_tuple_map
+            w_l_tuple = '{}|{}'.format(exercise_item.text, exercise_item.label)
+            if w_l_tuple not in w_l_tuple_map:
+                w_l_tuple_map[w_l_tuple] = {'w_l_tuple': w_l_tuple, 'w_l_tuple_id': len(w_l_tuple_map), 'cnt': 0 } #
+            w_l_tuple_map[w_l_tuple]['cnt'] += 1
 
 
     fp.close()
@@ -289,73 +320,405 @@ def parse_lines(data_file, user_interactions, split, vocab, word_map, exercise_m
     return update_cnt
 
 
-def get_statistics(data_file, split=None):
+def get_statistics(data_file, target_split=None):
+
+    def format_distribution(distr, total):
+        distr = collections.OrderedDict(sorted(distr.items(), key=lambda x:x[0]))
+        acc = 0
+        for key in distr:
+            distr[key] = (distr[key], acc + (distr[key] / total))
+            acc = distr[key][1]
+        
+        return distr
+
     # TODO: update me
     # 0 train, 1 dev, 2 test, None all
     stats = {
         'user_cnt': 0,
         'interaction_cnt': 0,
         'word_cnt': 0,
-        'interaction_per_user': 0,
-        'word_per_user': 0,
-        'word_per_interaction': 0,
-        'uniq_exercise_cnt': 0,
-        'uniq_word_cnt': 0,
-        'uniq_exercise_per_user': 0,
-        'uniq_word_per_user': 0,
-        'x_max_length': float('-inf'),
-        'x_min_length': float('inf'),
-        'x_avg_length': 0,
-        'x_length_distribution': [0 for i in range(50)]
+
+        'interaction_num_distribution': {},          # interaction per user
+        'max_interaction_num': float('-inf'),
+        'min_interaction_num': float('inf'),
+        
+        'interaction_length_distribution': {},       # wor per interaction 
+        'interaction_max_length': float('-inf'),
+        'interaction_min_length': float('inf'),
+        
+        'length_distribution': {},                   # word per user
+        'max_length': float('-inf'),                  
+        'min_length': float('inf'),
     }
-    
-    uniq_words = set()
-    uniq_exercises = set()
 
-    for i in range(self.__len__()):
-        user_uniq_words = set()
-        user_uniq_exercises = set()
-        exercise = []
-        x_length = 0
-        
-        for j in range(1, len(self.exercises[i])):
-            cur_split = self.split_labels[i][j]
-            if split is not None and cur_split != split:
-                continue
+    with open(data_file, 'r') as fp:
+        for line in fp.readlines():
+            stats['user_cnt'] += 1
+            data = json.loads(line.strip())
+
+            interaction_cnt = 0
+            word_cnt = 0
+
+            for split in ['train', 'dev', 'test']:
+                if target_split and split != target_split:
+                    continue
+                interaction_cnt += len(data[split])
+                
+                for interaction in data[split]:
+                    word_cnt += len(interaction['exercise'])
+
+                    ## interaction_length_distribution distribution
+                    bucket = len(interaction['exercise'])
+                    if bucket not in stats['interaction_length_distribution']:
+                        stats['interaction_length_distribution'][bucket] = 0
+                    stats['interaction_length_distribution'][bucket] += 1
+
+                    if len(interaction['exercise']) > stats['interaction_max_length']:
+                        stats['interaction_max_length'] = len(interaction['exercise'])
+                    if len(interaction['exercise']) < stats['interaction_min_length']:
+                        stats['interaction_min_length'] = len(interaction['exercise'])
+                    
+
+            stats['interaction_cnt'] += interaction_cnt
+            stats['word_cnt'] += word_cnt
+
+            # concat length distribution 
+            if word_cnt > stats['max_length']:
+                stats['max_length'] = word_cnt
+            if word_cnt < stats['min_length']:
+                stats['min_length'] = word_cnt
             
-            x_length += 1 
-            if self.exercises[i][j] == self.vocab['<sep>']:
-                stats['interaction_cnt'] += 1
-                user_uniq_exercises.add('#'.join(exercise))
-                uniq_exercises.add('#'.join(exercise))
-                exercise = []
-            elif self.exercises[i][j] > 5:
-                stats['word_cnt'] += 1
-                exercise.append(str(self.exercises[i][j]))
-                user_uniq_words.add(self.exercises[i][j])
-                uniq_words.add(self.exercises[i][j])
+            bucket = (word_cnt // 100) * 100
+            if bucket not in stats['length_distribution']:
+                stats['length_distribution'][bucket] = 0
+            stats['length_distribution'][bucket] += 1
 
-        stats['uniq_exercise_per_user'] += len(user_uniq_exercises)
-        stats['uniq_word_per_user'] += len(user_uniq_words)
+            # interaction_per_user distribution
+            if interaction_cnt > stats['max_interaction_num']:
+                stats['max_interaction_num'] = interaction_cnt
+            if interaction_cnt < stats['min_interaction_num']:
+                stats['min_interaction_num'] = interaction_cnt
+            
+            bucket = (interaction_cnt // 10)*10
+            if bucket not in stats['interaction_num_distribution']:
+                stats['interaction_num_distribution'][bucket] = 0
+            stats['interaction_num_distribution'][bucket] += 1
 
-        if x_length > stats['x_max_length']:
-            stats['x_max_length'] = x_length
-        if x_length < stats['x_min_length']:
-            stats['x_min_length'] = x_length
+                
+            
+
+    stats['length_distribution'] = format_distribution(stats['length_distribution'], stats['user_cnt'])
+    stats['interaction_num_distribution'] = format_distribution(stats['interaction_num_distribution'], stats['user_cnt'])
+    stats['interaction_length_distribution'] = format_distribution(stats['interaction_length_distribution'], stats['interaction_cnt'])
+    pprint(stats)
+
+
+
+def ascii_encode(x):
+    # str => int list 
+    result = []
+    for char in x:
+        result.append(ord(char))
+    return result
+
+def ascii_decode(x):
+    # int list => str
+    result = []
+    for number in x:
+        result.append(chr(number))
+    return ''.join(result)
+
+
+class KTTokenizer:
+    def __init__(self, word_file, w_l_tuple_file, max_seq_len, label_pad_id=-100):
         
-        stats['x_length_distribution'][min(x_length//100, len(stats['x_length_distribution'])-1)] += 1
-        stats['x_avg_length'] += x_length
-    
-    stats['interaction_per_user'] = stats['interaction_cnt'] / stats['user_cnt']
-    stats['word_per_user'] = stats['word_cnt'] / stats['user_cnt']
-    stats['uniq_exercise_cnt'] = len(uniq_exercises) 
-    stats['uniq_word_cnt'] = len(uniq_words)
-    stats['uniq_exercise_per_user'] /= stats['user_cnt']
-    stats['uniq_word_per_user'] /= stats['user_cnt']
-    stats['word_per_interaction'] = stats['word_cnt'] / stats['interaction_cnt']
-    stats['x_avg_length'] /= stats['user_cnt']
+        self.max_seq_len = max_seq_len
+        self.label_pad_id = -100
 
-    return stats
+        self.word_map = {}
+        df_words = pd.read_csv(word_file)
+        for idx, row in df_words.iterrows():
+            self.word_map[row['word']] = int(row['word_id'])
+        
+        self.w_l_tuple_map = {}
+        df_w_l_tuples = pd.read_csv(w_l_tuple_file)
+        for idx, row in df_w_l_tuples.iterrows():
+            self.w_l_tuple_map[row['w_l_tuple']] = int(row['w_l_tuple_id'])
+        
+        self.task_map = {
+            '<pad>': 0,
+            'reverse_translate': 1,
+            'reverse_tap': 2,
+            'listen': 3
+        }
+
+        self.split_map = {
+            '<pad>': 0,
+            'train': 1,
+            'dev': 2,
+            'test': 3 
+        }
+
+
+        self.word_pad_id = self.word_map['<pad>']
+        self.w_l_tuple_pad_id = self.w_l_tuple_map['<pad>']
+        self.task_pad_id = self.task_map['<pad>']
+        self.split_pad_id = self.split_map['<pad>']
+
+        self.word_sep_id = self.word_map['<sep>']
+        self.w_l_tuple_sep_id = self.w_l_tuple_map['<sep>']
+
+        self.word_unk_id = self.word_map['<unk>']
+        self.w_l_tuple_unk_id = self.w_l_tuple_map['<unk>']
+
+
+        self.num_words = len(self.word_map)
+        self.num_w_l_tuples = len(self.w_l_tuple_map)
+        self.num_tasks = len(self.task_map)
+
+
+    def __call__(self, user_log, padding=True, truncation=True):
+
+        # begining token <sep>
+
+        tokenized = {
+            'user_id': ascii_encode(user_log['user_id']),
+            'user_ability': user_log['user_ability'],
+            'word_ids': [],
+            'w_l_tuple_ids': [],
+            'task_ids': [],
+            'interaction_ids': [],
+            'sep_indices': [],
+            'labels': [],
+            'split_ids': [],
+            'position_ids': []
+        }
+
+        tokenized['word_ids'].append(self.word_sep_id)
+        tokenized['w_l_tuple_ids'].append(self.w_l_tuple_sep_id)
+        tokenized['task_ids'].append(self.task_pad_id)
+        tokenized['interaction_ids'].append(0)
+        tokenized['sep_indices'].append(0)
+        tokenized['labels'].append(self.label_pad_id)
+        tokenized['split_ids'].append(self.split_pad_id)
+
+        for split in ['train', 'dev', 'test']:
+            for interaction_id, interaction in enumerate(user_log[split]):
+                for idx, item in enumerate(interaction['exercise']):
+                    tokenized['word_ids'].append(self.word_map.get(item['text'], self.word_unk_id))
+                    tokenized['w_l_tuple_ids'].append(self.w_l_tuple_map.get('{}|{}'.format(item['text'], item['label']), self.w_l_tuple_unk_id))
+                    tokenized['task_ids'].append(self.task_map[interaction['format']])
+                    tokenized['interaction_ids'].append(interaction_id)
+                    tokenized['labels'].append(item['label'])
+                    tokenized['split_ids'].append(self.split_map[split])
+
+                # <sep> in the end of each interaction
+                tokenized['word_ids'].append(self.word_sep_id)
+                tokenized['w_l_tuple_ids'].append(self.w_l_tuple_sep_id)
+                tokenized['task_ids'].append(self.task_pad_id)
+                tokenized['interaction_ids'].append(interaction_id+1)
+
+                tokenized['labels'].append(self.label_pad_id)
+                tokenized['split_ids'].append(self.split_map[split])
+
+        tokenized['position_ids'] = [i for i in range(len(tokenized['word_ids']))]
+        tokenized['sep_indices'] = [idx for idx in range(len(tokenized['word_ids'])) if tokenized['word_ids'][idx]==self.word_sep_id]
+
+        ## when truncation words, adjust <sep> indices and pad if needed
+        if truncation and len(tokenized['word_ids']) > self.max_seq_len:
+            self.truncate(tokenized)
+
+        if padding and len(tokenized['word_ids']) < self.max_seq_len:
+            self.pad(tokenized)
+            
+        return tokenized
+
+
+    def pad(self, tokenized, max_seq_len=None, max_interaction_num=None):
+        max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
+        
+        seq_pad_length = self.max_seq_len - len(tokenized['word_ids'])
+        if seq_pad_length > 0:
+            tokenized['position_ids'].extend([idx for idx in range(len(tokenized['word_ids']), max_seq_len)])
+            tokenized['word_ids'].extend([self.word_pad_id for i in range(seq_pad_length)])
+            tokenized['w_l_tuple_ids'].extend([self.w_l_tuple_pad_id for i in range(seq_pad_length)])
+            tokenized['task_ids'].extend([self.task_pad_id for i in range(seq_pad_length)])
+            tokenized['interaction_ids'].extend([-1 for i in range(seq_pad_length)])
+            tokenized['labels'].extend([self.label_pad_id for i in range(seq_pad_length)])
+            tokenized['split_ids'].extend([self.split_pad_id for i in range(seq_pad_length)])
+        
+        if max_interaction_num:
+            sep_indices_pad_length = max_interaction_num - len(tokenized['sep_indices'])
+            if sep_indices_pad_length > 0:
+                tokenized['sep_indices'].extend([-1 for i in range(sep_indices_pad_length)]) # sep pad with -1
+
+
+    def truncate(self, tokenized, max_seq_len=None, debug=False):
+        
+        max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
+
+
+        trunc_length = len(tokenized['word_ids']) - max_seq_len
+
+        if trunc_length <= 0:
+            return
+
+        if tokenized['word_ids'][trunc_length+1] == self.word_sep_id:
+            # print('drop first')
+            # skip the first token and start with the next <sep> token to avoid "<sep><sep>" start
+            trunc_length += 1
+            tokenized['word_ids'] = tokenized['word_ids'][trunc_length: ]
+            tokenized['w_l_tuple_ids'] = tokenized['w_l_tuple_ids'][trunc_length: ]
+            tokenized['task_ids'] = tokenized['task_ids'][trunc_length: ]
+
+            tokenized['labels'] = tokenized['labels'][trunc_length: ]
+            tokenized['split_ids'] = tokenized['split_ids'][trunc_length: ]
+            tokenized['position_ids'] = [i for i in range(len(tokenized['word_ids']))]
+            
+            # reconstruct sep indices            
+            tokenized['sep_indices'] = [idx for idx in range(len(tokenized['word_ids'])) if tokenized['word_ids'][idx]==self.word_sep_id]
+
+            # reconstruct interaction_ids
+            interaction_id = -1
+            tokenized['interaction_ids'] = []
+            for i in range(len(tokenized['word_ids'])):
+                if tokenized['word_ids'][i] == self.word_sep_id:
+                    interaction_id += 1
+                tokenized['interaction_ids'].append(interaction_id)
+            
+            self.pad(tokenized) # pad one position in the end
+        else:
+            # print('not drop first')
+            tokenized['word_ids'] = tokenized['word_ids'][trunc_length: ]
+            tokenized['w_l_tuple_ids'] = tokenized['w_l_tuple_ids'][trunc_length: ]
+            tokenized['task_ids'] = tokenized['task_ids'][trunc_length: ]
+
+            tokenized['labels'] = tokenized['labels'][trunc_length: ]
+            tokenized['split_ids'] = tokenized['split_ids'][trunc_length: ]
+            tokenized['position_ids'] = [i for i in range(len(tokenized['word_ids']))]
+
+            # reset first token
+            tokenized['word_ids'][0] = self.word_sep_id
+            tokenized['w_l_tuple_ids'][0] = self.w_l_tuple_sep_id
+            tokenized['task_ids'][0] = self.task_pad_id
+            tokenized['interaction_ids'][0] = 0
+            tokenized['sep_indices'][0] = 0
+            tokenized['labels'][0] = self.label_pad_id
+            tokenized['split_ids'][0] = self.split_pad_id
+
+            # reconstruct sep indices            
+            tokenized['sep_indices'] = [idx for idx in range(len(tokenized['word_ids'])) if tokenized['word_ids'][idx]==self.word_sep_id]
+
+            # reconstruct interaction_ids
+            tokenized['interaction_ids'] = []
+            interaction_id = -1
+            for i in range(len(tokenized['word_ids'])):
+                if tokenized['word_ids'][i] == self.word_sep_id:
+                    interaction_id += 1
+                tokenized['interaction_ids'].append(interaction_id)
+
+
+
+
+class DuolingoKTDataset(Dataset):
+    def __init__(self, data_file, tokenizer):
+
+        self.tokenizer = tokenizer
+
+        self.data = []
+
+        with open(data_file, 'r') as fp:
+            for line in fp.readlines():
+                user_log = json.loads(line.strip())
+                tokenized = self.tokenizer(user_log)
+                self.data.append(tokenized)
+
+
+    def construct_collate_fn(self, tokenizer, max_seq_len=None):
+        
+        def collate_fn(batch_data):
+            batch_max_interactions = max([len(data['sep_indices']) for data in batch_data])
+
+            batch_max_seq_len = max([len(data['word_ids']) for data in batch_data])
+
+            if max_seq_len and max_seq_len < batch_max_seq_len:
+                batch_max_seq_len = max_seq_len
+
+            user_ids = [data['user_id'] for data in batch_data]
+
+            # align batch
+            for data in batch_data:
+                tokenizer.truncate(data, max_seq_len=batch_max_seq_len, debug=True)
+                tokenizer.pad(data, max_seq_len=batch_max_seq_len, max_interaction_num=batch_max_interactions)
+            
+            x_user_ids = torch.tensor([data['user_id'] for data in batch_data])
+            x_user_abilities = torch.tensor([data['user_ability'] for data in batch_data])
+            x_word_ids = torch.tensor([data['word_ids'] for data in batch_data])
+            x_w_l_tuple_ids = torch.tensor([data['w_l_tuple_ids'] for data in batch_data])
+            x_position_ids = torch.tensor([data['position_ids'] for data in batch_data])
+            x_task_ids = torch.tensor([data['task_ids'] for data in batch_data])
+            x_interaction_ids = torch.tensor([data['interaction_ids'] for data in batch_data])
+            x_sep_indices = torch.tensor([data['sep_indices'] for data in batch_data])
+            y_labels = torch.tensor([data['labels'] for data in batch_data])
+            split_ids = torch.tensor([data['split_ids'] for data in batch_data]) # 0 train, 1 dev, 2 test
+
+            # build word attn mask, [batch_size, target_L, source_L]
+            x_word_attn_masks = []
+            for data in batch_data:
+                word_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
+                for target_idx in range(batch_max_seq_len): # row
+                    # situation 1: diagnol always == 1
+                    word_attn_mask[target_idx][target_idx] = False
+                    for source_idx in range(batch_max_seq_len): # column
+                        # situation 2: words within same interaction == 1
+                        if data['word_ids'][target_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['word_ids'][source_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
+                            # for pad word, word_id = -1
+                            word_attn_mask[target_idx][source_idx] = False
+                        # situation 3: <sep> with last interaction words == 1  
+                        if data['word_ids'][target_idx] == tokenizer.word_sep_id and data['word_ids'][source_idx] != tokenizer.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
+                            word_attn_mask[target_idx][source_idx] = False
+
+                x_word_attn_masks.append(word_attn_mask)
+            x_word_attn_masks = torch.tensor(x_word_attn_masks)
+
+            # build tuple attn mask, [batch_size, max_seq_len, max_seq_len]
+            x_w_l_tuple_attn_masks = []
+            for data in batch_data:
+                w_l_tuple_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
+                for target_idx in range(batch_max_seq_len): # row
+                    if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_pad_id:
+                        w_l_tuple_attn_mask[target_idx][target_idx] = False
+                    for source_idx in range(batch_max_seq_len): # column
+                        # situation 1: (<sep> with <= self) =1
+                        if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_sep_id and source_idx <= target_idx:
+                            w_l_tuple_attn_mask[target_idx][source_idx] = False
+                        # situation 2: target is word
+                        if data['w_l_tuple_ids'][target_idx] not in (tokenizer.w_l_tuple_sep_id, tokenizer.w_l_tuple_pad_id):
+                            # with ex-interactions =1
+                            if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] >=0:
+                                w_l_tuple_attn_mask[target_idx][source_idx] = False
+                            # with last sep = 1
+                            if data['interaction_ids'][source_idx] == data['interaction_ids'][target_idx] and data['w_l_tuple_ids'][source_idx] == tokenizer.w_l_tuple_sep_id:
+                                w_l_tuple_attn_mask[target_idx][source_idx] = False
+
+
+                x_w_l_tuple_attn_masks.append(w_l_tuple_attn_mask)            
+            x_w_l_tuple_attn_masks = torch.tensor(x_w_l_tuple_attn_masks)
+            
+            return x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids
+
+        
+        return collate_fn
+
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+    def __len__(self):
+        return len(self.data)
+
+
 
 
 class DuolingoPersonalziedQGDataset(Dataset):
@@ -394,7 +757,7 @@ class DuolingoPersonalziedQGDataset(Dataset):
         return self.user_ids[index], self.difficulty[index], self.x_keywords[index], self.y_exercises[index]
 
     def __len__(self):
-        return len(self.x_keywords)
+        return len(self.data)
 
 
     def calc_word_coverage(self):
@@ -614,22 +977,19 @@ if __name__ == '__main__':
         filemode='w'
     )  
 
-
-    # build_dataset(
-    #     train_raw=args.duolingo_en_es_train_raw, 
-    #     dev_raw=args.duolingo_en_es_dev_raw, 
-    #     dev_key_raw=args.duolingo_en_es_dev_key_raw, 
-    #     test_raw=args.duolingo_en_es_test_raw, 
-    #     test_key_raw=args.duolingo_en_es_test_key_raw, 
-    #     format_output=args.duolingo_en_es_format, 
-    #     vocab_file=args.duolingo_en_es_vocab, 
-    #     word_file=args.duolingo_en_es_words, 
-    #     exercise_file=args.duolingo_en_es_exercises, 
-    #     non_adaptive_gen_file=args.duolingo_en_es_non_adaptive_exercise_gen,
-    #     build_kt=True,
-    #     build_gen=True
-    # )
-
-    # sampler = WordSampler(sample_rate=0.5)
-
-
+    # stats = get_statistics('/Users/cuipeng/Documents/Datasets/duolingo_2018_shared_task/data_en_es/en_es_format.jsonl', target_split=None)
+    
+    build_dataset(
+        train_raw=args.duolingo_en_es_train_raw, 
+        dev_raw=args.duolingo_en_es_dev_raw, 
+        dev_key_raw=args.duolingo_en_es_dev_key_raw, 
+        test_raw=args.duolingo_en_es_test_raw, 
+        test_key_raw=args.duolingo_en_es_test_key_raw, 
+        format_output=args.duolingo_en_es_format, 
+        w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
+        word_file=args.duolingo_en_es_word_file, 
+        exercise_file=args.duolingo_en_es_exercise_file, 
+        non_adaptive_gen_file=args.duolingo_en_es_non_adaptive_exercise_gen,
+        build_kt=True,
+        build_gen_non_adaptive=False
+    )
