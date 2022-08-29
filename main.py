@@ -71,14 +71,14 @@ def train_kt(args, local_rank, gpu_cnt, device):
         dataloader = DataLoader(
             dataset, 
             batch_size=args.kt_train_batch_size, 
-            collate_fn=dataset.construct_collate_fn(tokenizer, max_seq_len=args.kt_max_seq_len),
+            # collate_fn=dataset.construct_collate_fn(tokenizer, max_seq_len=args.kt_max_seq_len),
             sampler=sampler
     	)
     else:
         dataloader = DataLoader(
             dataset,
             batch_size=args.kt_train_batch_size,
-            collate_fn=dataset.construct_collate_fn(tokenizer, max_seq_len=args.kt_max_seq_len),
+            # collate_fn=dataset.construct_collate_fn(tokenizer, max_seq_len=args.kt_max_seq_len),
             shuffle=True
         )
 

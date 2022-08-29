@@ -531,25 +531,50 @@ class KTTokenizer:
         if truncation and len(tokenized['word_ids']) > self.max_seq_len:
             self.truncate(tokenized)
 
-        if padding and len(tokenized['word_ids']) < self.max_seq_len:
-            self.pad(tokenized)
-            
+        # if padding and len(tokenized['word_ids']) < self.max_seq_len:
+        #     self.pad(tokenized)
+        
+        tokenized['word_attn_mask'] = self.build_word_attn_mask(tokenized)
+        tokenized['w_l_tuple_attn_mask'] = self.build_w_l_tuple_attn_mask(tokenized)
+
         return tokenized
     
+    
     def build_word_attn_mask(self, data):
-                word_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
-                for target_idx in range(batch_max_seq_len): # row
-                    # situation 1: diagnol always == 1
-                    word_attn_mask[target_idx][target_idx] = False
-                    for source_idx in range(batch_max_seq_len): # column
-                        # situation 2: words within same interaction == 1
-                        if data['word_ids'][target_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['word_ids'][source_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
-                            # for pad word, word_id = -1
-                            word_attn_mask[target_idx][source_idx] = False
-                        # situation 3: <sep> with last interaction words == 1  
-                        if data['word_ids'][target_idx] == tokenizer.word_sep_id and data['word_ids'][source_idx] != tokenizer.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
-                            word_attn_mask[target_idx][source_idx] = False
- 
+        batch_max_seq_len = len(data['word_ids'])
+        word_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
+        for target_idx in range(batch_max_seq_len): # row
+            # situation 1: diagnol always == 1
+            word_attn_mask[target_idx][target_idx] = False
+            for source_idx in range(batch_max_seq_len): # column
+                # situation 2: words within same interaction == 1
+                if data['word_ids'][target_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['word_ids'][source_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
+                    # for pad word, word_id = -1
+                    word_attn_mask[target_idx][source_idx] = False
+                # situation 3: <sep> with last interaction words == 1  
+                if data['word_ids'][target_idx] == tokenizer.word_sep_id and data['word_ids'][source_idx] != tokenizer.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
+                    word_attn_mask[target_idx][source_idx] = False
+        return word_attn_mask
+
+    def build_w_l_tuple_attn_mask(self, data):
+        batch_max_seq_len = len(data['word_ids'])
+        w_l_tuple_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
+        for target_idx in range(batch_max_seq_len): # row
+            if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_pad_id:
+                w_l_tuple_attn_mask[target_idx][target_idx] = False
+            for source_idx in range(batch_max_seq_len): # column
+                # situation 1: (<sep> with <= self) =1
+                if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_sep_id and source_idx <= target_idx:
+                    w_l_tuple_attn_mask[target_idx][source_idx] = False
+                # situation 2: target is word
+                if data['w_l_tuple_ids'][target_idx] not in (tokenizer.w_l_tuple_sep_id, tokenizer.w_l_tuple_pad_id):
+                    # with ex-interactions =1
+                    if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] >=0:
+                        w_l_tuple_attn_mask[target_idx][source_idx] = False
+                    # with last sep = 1
+                    if data['interaction_ids'][source_idx] == data['interaction_ids'][target_idx] and data['w_l_tuple_ids'][source_idx] == tokenizer.w_l_tuple_sep_id:
+                        w_l_tuple_attn_mask[target_idx][source_idx] = False
+        return w_l_tuple_attn_mask
 
     def pad(self, tokenized, max_seq_len=None, max_interaction_num=None):
         max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
