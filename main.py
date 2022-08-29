@@ -139,6 +139,7 @@ def train_kt(args, local_rank, gpu_cnt, device):
 
             batch_size = x_user_ids.size(0) # for last batch
             batch_seq_len = x_word_ids.size(1)
+            batch_user_ids = [ascii_decode(user_id) for user_id in x_user_ids]
 
             # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
             x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
@@ -163,21 +164,23 @@ def train_kt(args, local_rank, gpu_cnt, device):
                 x_sep_indices=x_sep_indices.to(device)
             )   # logits: [batch_size, seq_len] # memory_states: [batch_size, num_interactions]
 
-            logits = logits.view(batch_size*batch_seq_len, 2)
-            y_labels = y_labels.view(batch_size*batch_seq_len, )
-
-            logging.info('-- logits shape:{}, memory shape: {}, label shape: {}'.format(logits.shape, memory_states.shape, y_labels.shape))
-
-            split_ids = split_ids.view(batch_size*batch_seq_len, )
             # optimize
-            y_labels_train = torch.where(split_ids==3, y_labels, -100)
+            logits_ = logits.view(batch_size*batch_seq_len, 2)
+            y_labels_ = y_labels.view(batch_size*batch_seq_len, )
+            split_ids_ = split_ids.view(batch_size*batch_seq_len, )
 
-            loss = loss_function(logits, y_labels_train.to(device))
+
+            y_labels_train = torch.where(split_ids_==3, y_labels_, -100)
+
+            valid_train_examples = torch.where(y_labels_train>=0, True, False).sum()
+            if valid_train_examples < 0.5 * batch_size * batch_seq_len:
+                logging.warning('-- In {}/{} epoch, {}/{} batch, user_ids {}, no enough data for train, total steps: {}, valid train steps:{}, discard!'.format(
+                    epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, batch_size * batch_seq_len, valid_train_examples
+                ))
+                continue 
+
+            loss = loss_function(logits_, y_labels_train.to(device))
             epoch_loss += loss
-            
-            # y_labels_dev = torch.where(split_ids==1, y_labels, -100)
-            # y_labes_test = torch.where(split_ids==2, y_labels, -100)
-            # y_labels_train = y_labels_train.view(y_labels_train.size(0), -1)
 
             loss.backward()
             optimizer.step()
@@ -192,7 +195,6 @@ def train_kt(args, local_rank, gpu_cnt, device):
             kt_evaluator.labels.extend(y_labels.detach().cpu().numpy())
             kt_evaluator.split_ids.extend(split_ids.detach().cpu().numpy())
             kt_evaluator.states.extend(memory_states.detach().cpu().numpy())
-            break
 
         logging.info('-- local rank {} finished {}/{} epoch'.format(local_rank, epoch_id, args.kt_train_epoch))
 
@@ -220,7 +222,7 @@ def train_kt(args, local_rank, gpu_cnt, device):
         else:
             performance = kt_evaluator.compute_metrics()
             logging.info('-- {}/{} epoch, kt_performance: {}'.format(epoch_id, args.kt_train_epoch, performance))
-        
+
             if performance['dev']['roc'] > save_info['best_validation_performance']:
                 save_info['epoch'] = epoch_id
                 save_info['loss'] = epoch_loss
@@ -231,7 +233,6 @@ def train_kt(args, local_rank, gpu_cnt, device):
                 kt_evaluator.write(args.kt_best_epoch_dir)
         ## end epoch evaluation
 
-        break
 
     logging.info('-- local rank {} finished training'.format(local_rank))
 

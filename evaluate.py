@@ -1,4 +1,4 @@
-import sys, json, spacy, logging
+import sys, json, spacy, logging, torch
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
 from rouge import Rouge
 import pandas as pd
@@ -89,7 +89,7 @@ class QGEvaluator:
         difficulty_pccs = np.corrcoef(self.difficulty_scores, self.generated_difficulty_scores)[0][1] # pearson coefficient  
         difficulty_accuracy = accuracy_score(y_true=self.difficulty_levels, y_pred=self.generated_difficulty_levels)
 
-        return {'difficulty_pccs': difficulty_pccs, 'diffculty_accuarcy': difficulty_accuracy}    
+        return {'difficulty_pccs': difficulty_pccs, 'diffculty_accuracy': difficulty_accuracy}    
 
 
     def __compute_difficulty_score(self, sentence):
@@ -129,34 +129,57 @@ class KTEvaluator:
         # ROC and F1 score
         # logits: [example_num, label_num(2)]
         # labels: [example_num, ]
+        
+        total_examples = len(self.user_ids)
 
         results = {
             'train': {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}, 
             'dev':  {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}, 
             'test':  {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}
         }
-
-        total_examples = len(self.user_ids)
         
-        print('split_ids', self.split_ids)
-        print('logits', self.logits)
-        print('labels', self.labels)
+        collections = {
+            'train': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
+            'dev': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
+            'test': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
+        }
 
-        for sid, split in ([(1, 'train'), (2, 'dev'), (3, 'test')]):
-            valid_positions = np.where(self.split_ids==sid, True, False) # filter pad positions and other splits
-            if not valid_positions.any():
-                continue # no such split data
-            valid_logits = self.logits[valid_positions] # flat
-            valid_labels = self.labels[valid_positions] # flat
-            
-            pred_labels = np.argmax(valid_logits, axis=-1)
-            positive_probs = F.softmax(torch.tensor(valid_logits), dim=-1)[:1].numpy()
+        for example_id in range(total_examples):
+            for sid, split in ([(1, 'train'), (2, 'dev'), (3, 'test')]):
+                split_positions = np.where(self.split_ids[example_id] ==sid, True, False) # filter other splits
+                non_pad_positions = np.where(self.labels[example_id]>=0, True, False)   # filter pad labels
+                valid_positions = split_positions & non_pad_positions
 
-            results[split]['roc'] = roc_auc_score(y_true=valid_labels, y_score=positive_probs)
-            results[split]['f1_score'] = f1_score(y_true=valid_labels, y_pred=pred_labels)
-            results[split]['precision'] = precision(y_true=valid_labels, y_pred=pred_labels)
-            results[split]['recall'] = precision(y_true=valid_labels, y_pred=pred_labels)
-            results[split]['accuarcy'] = accuracy_score(y_true=valid_labels, y_pred=pred_labels)
+                if not valid_positions.any():
+                    logging.warning('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(self.user_ids[example_id]), split))
+                    continue # no such split data
+                
+
+                valid_logits = self.logits[example_id][valid_positions] # flat
+                valid_labels = self.labels[example_id][valid_positions] # flat
+                
+                pred_labels = np.argmax(valid_logits, axis=-1)
+                positive_probs = F.softmax(torch.tensor(valid_logits), dim=-1)[:,1].numpy()            
+
+                collections[split]['pred_labels'].extend(pred_labels)
+                collections[split]['labels'].extend(valid_labels)
+                collections[split]['positive_probs'].extend(positive_probs)
+
+
+        for split in ['train', 'dev', 'test']:
+            collections[split]['pred_labels'] = np.array(collections[split]['pred_labels'])
+            collections[split]['labels'] = np.array(collections[split]['labels'])
+            collections[split]['positive_probs'] = np.array(collections[split]['positive_probs'])
+
+            if len(collections[split]['pred_labels']) == 0 or len(collections[split]['labels']) == 0 or len(collections[split]['positive_probs']) == 0:
+                logging.warning('-- Total: no data for {} evaluation'.format(split))
+                continue
+
+            results[split]['roc'] = roc_auc_score(y_true=collections[split]['labels'], y_score=collections[split]['positive_probs'])
+            results[split]['f1_score'] = f1_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
+            results[split]['precision'] = precision_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
+            results[split]['recall'] = recall_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
+            results[split]['accuracy'] = accuracy_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
 
         return results
 
@@ -185,6 +208,6 @@ class KTEvaluator:
                 'states': self.states[idx].tolist(),
                 'split_ids': self.split_ids[idx].tolist()
             }
-            file_name = ascii_decode(self.user[idx])
+            file_name = ascii_decode(self.user_ids[idx])
             with open(os.path.join(dir_name, file_name), 'w') as fp:
                 fp.write(json.dumps(file_name+'\n'))
