@@ -25,7 +25,7 @@ def train_kt(args, local_rank, gpu_cnt, device):
     # num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, alpha=0.8, emb_padding_idx=0
     if gpu_cnt > 0:
         args.kt_train_batch_size = args.kt_train_batch_size //  gpu_cnt
-
+    
     tokenizer = KTTokenizer(
         word_file=args.duolingo_en_es_word_file, 
         w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
@@ -58,7 +58,8 @@ def train_kt(args, local_rank, gpu_cnt, device):
 
     logging.info('-- local_rank: {}, building dataset ...'.format(local_rank))
     
-    dataset = DuolingoKTDataset(data_file=args.duolingo_en_es_format, tokenizer=tokenizer, max_lines=-1)
+    dataset = DuolingoKTDataset(data_file=args.duolingo_en_es_format, tokenizer=tokenizer, raw=True, max_lines=16)
+    dataset.dump_data(args.kt_format_data)
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
 
     # if local_rank == 0:
@@ -117,15 +118,12 @@ def train_kt(args, local_rank, gpu_cnt, device):
         if gpu_cnt > 1:
             dataloader.sampler.set_epoch(epoch_id)
         
-        kt_evaluator = KTEvaluator()
+        kt_evaluator = KTEvaluator(num_words=tokenizer.num_words)
         epoch_loss = 0
         
-        i_max_len = 0
-        i_max_int = 0
-        # x_user_ids, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids
-        for batch_id, (x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids) in enumerate(dataloader):
+        for batch_id, (x_user_ids, x_user_abilities, x_word_ids, x_valid_length, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, x_valid_interactions, y_labels, split_ids) in enumerate(dataloader):
             logging.debug('-- local rank {}, batch data:\n x_user_ids: {},\n x_user_abilities: {},\n x_word_ids: {},\n x_w_l_tuple_ids: {},\n x_position_ids: {},\n, x_task_ids: {},\n x_interaction_ids: {},\n x_sep_indices: {},\n y_labels: {},\n split_ids: {},\n x_word_attn_masks: {},\n x_w_l_tuple_attn_masks: {},\n.'.format(local_rank, x_user_ids, x_user_abilities, x_word_ids, x_w_l_tuple_ids, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids, x_word_attn_masks, x_w_l_tuple_attn_masks))
-
+             
             '''
             x_user_ids:        [batch_size, 5] 
             x_user_abilities:  [batch_size, 1]
@@ -140,17 +138,11 @@ def train_kt(args, local_rank, gpu_cnt, device):
             split_ids:         [batch_size, seq_len]
             '''
             optimizer.zero_grad()
-
+            
             batch_size = x_user_ids.size(0) # for last batch
             batch_seq_len = x_word_ids.size(1)
             batch_user_ids = [ascii_decode(user_id) for user_id in x_user_ids]
-            logging.info('local rank {}, batch_idx {}/{}'.format(local_rank, batch_id, batch_steps))
-            if i_max_len < batch_seq_len:
-                i_max_len = batch_seq_len
-            if i_max_int < x_sep_indices.size(1):
-                i_max_int = x_sep_indices.size(1)
-            continue
-            # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
+
             # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
             x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
                 batch_size * args.kt_num_attn_heads_interaction, 
@@ -163,22 +155,38 @@ def train_kt(args, local_rank, gpu_cnt, device):
                 batch_seq_len, 
             )
 
+            x_user_ids = x_user_ids.to(device)
+            x_user_abilities = x_user_abilities.to(device)
+            x_word_ids = x_word_ids.to(device)
+            x_word_attn_masks = x_word_attn_masks.to(device)
+            x_w_l_tuple_ids = x_w_l_tuple_ids.to(device)
+            x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.to(device)
+            x_position_ids = x_position_ids.to(device)
+            x_task_ids = x_task_ids.to(device)
+            x_interaction_ids = x_interaction_ids.to(device)
+            x_sep_indices = x_sep_indices.to(device)
+            y_labels = y_labels.to(device)
+            split_ids = split_ids.to(device)
+            
+            x_valid_length = x_valid_length.to(device)
+            x_valid_interactions = x_valid_interactions.to(device)
+            # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
+
             logits, memory_states = model(
-                x_word_ids=x_word_ids.to(device), 
-                x_word_attn_masks=x_word_attn_masks.to(device), 
-                x_w_l_tuple_ids=x_w_l_tuple_ids.to(device),
-                x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks.to(device),
-                x_position_ids=x_position_ids.to(device),
-                x_task_ids=x_task_ids.to(device),
-                x_interaction_ids=x_interaction_ids.to(device),
-                x_sep_indices=x_sep_indices.to(device)
+                x_word_ids=x_word_ids, 
+                x_word_attn_masks=x_word_attn_masks, 
+                x_w_l_tuple_ids=x_w_l_tuple_ids,
+                x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
+                x_position_ids=x_position_ids,
+                x_task_ids=x_task_ids,
+                x_interaction_ids=x_interaction_ids,
+                x_sep_indices=x_sep_indices
             )   # logits: [batch_size, seq_len] # memory_states: [batch_size, num_interactions]
 
             # optimize
             logits_ = logits.view(batch_size*batch_seq_len, 2)
             y_labels_ = y_labels.view(batch_size*batch_seq_len, )
             split_ids_ = split_ids.view(batch_size*batch_seq_len, )
-
 
             y_labels_train = torch.where(split_ids_==1, y_labels_, -100)
 
@@ -199,24 +207,80 @@ def train_kt(args, local_rank, gpu_cnt, device):
             lr_scheduler.step()
             
             logging.info('-- local_rank: {} In {}/{} epoch, {}/{} batch, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, loss))
-            ''' 
-            word_pad_length = int(args.kt_max_seq_length) - batch_seq_len
-            if pad_length > 0:
-                output_ids = F.pad(output_ids, pad=(0, pad_length), value=-1) 
-            '''
-            dist.all_gather()
+            
+            word_pad_length = int(args.kt_max_seq_len) - batch_seq_len
+            if word_pad_length > 0:
+                label_pads = torch.ones(batch_size, word_pad_length, device=device) * -200
+                y_labels = torch.cat([y_labels, label_pads], dim=1)
+                
+                logit_pads = torch.zeros(batch_size, word_pad_length, 2, device=device) 
+                logits = torch.cat([logits, logit_pads], dim=1)
+ 
+                split_pads = torch.zeros(batch_size, word_pad_length, device=device)
+                split_ids = torch.cat([split_ids, split_pads], dim=1)
+            
+            interaction_pad_length = 800 - x_sep_indices.size(1)
+            if interaction_pad_length < 0:
+                memory_states = memoy_states[:,:800,:]
+            elif interaction_pad_length > 0:
+                memory_state_pads = torch.zeros(batch_size, interaction_pad_length, tokenizer.num_words, 2, device=device) 
+                memory_states = torch.cat([memory_states, memory_state_pads], dim=1)
+
             # collect evaluation data
-            kt_evaluator.user_ids.extend(x_user_ids.numpy())
-            kt_evaluator.user_abilities.extend(x_user_abilities.numpy())
-            kt_evaluator.logits.extend(logits.detach().cpu().numpy())
-            kt_evaluator.labels.extend(y_labels.detach().cpu().numpy())
-            kt_evaluator.split_ids.extend(split_ids.detach().cpu().numpy())
-            kt_evaluator.states.extend(memory_states.detach().cpu().numpy())
+            batch_user_ids = [torch.zeros_like(x_user_ids, device=device) for i in range(gpu_cnt)]
+            batch_user_abilities = [torch.zeros_like(x_user_abilities, device=device) for i in range(gpu_cnt)]
+            batch_logits = [torch.zeros_like(logits, device=device) for i in range(gpu_cnt)]
+            batch_labels = [torch.zeros_like(y_labels, device=device) for i in range(gpu_cnt)]
+            batch_split_ids = [torch.zeros_like(split_ids, device=device) for i in range(gpu_cnt)]
+            batch_memory_states = [torch.zeros_like(memory_states, device=device) for i in range(gpu_cnt)]
+            batch_valid_length = [torch.zeros_like(x_valid_length, device=device) for i in range(gpu_cnt)] 
+            batch_valid_interactions = [torch.zeros_like(x_valid_interactions, device=device) for i in range(gpu_cnt)] 
+
+            dist.all_gather(batch_user_ids, x_user_ids.to(device))
+            dist.all_gather(batch_user_abilities, x_user_abilities.to(device))
+            dist.all_gather(batch_logits, logits)
+            dist.all_gather(batch_labels, y_labels)
+            dist.all_gather(batch_split_ids, split_ids)
+            dist.all_gather(batch_memory_states, memory_states)
+            dist.all_gather(batch_valid_length, x_valid_length)
+            dist.all_gather(batch_valid_interactions, x_valid_interactions)
+            
+            kt_evaluator.valid_length.extend(batch_valid_length)
+            kt_evaluator.valid_interactions.extend(batch_valid_interactions)
+            
+            kt_evaluator.user_ids.extend(batch_user_ids)
+            kt_evaluator.user_abilities.extend(batch_user_abilities)
+            kt_evaluator.logits.extend(batch_logits)
+            kt_evaluator.labels.extend(batch_labels)
+            kt_evaluator.split_ids.extend(batch_split_ids)
+            kt_evaluator.states.extend(batch_memory_states)
         
-        logging.info('-- rank {} max_seq {}, max_int {}'.format(local_rank, i_max_len, i_max_int))
         logging.info('-- local rank {} finished {}/{} epoch'.format(local_rank, epoch_id, args.kt_train_epoch))
-        exit(1)
         ## epoch evaluation
+        if gpu_cnt > 1 and local_rank == 0:
+            kt_evaluator.user_ids = torch.cat(kt_evaluator.user_ids, dim=0).detach().cpu().numpy()
+            kt_evaluator.user_abilities = torch.cat(kt_evaluator.user_abilities, dim=0).detach().cpu().numpy()
+            kt_evaluator.logits = torch.cat(kt_evaluator.logits, dim=0).detach().cpu().numpy()
+            kt_evaluator.labels = torch.cat(kt_evaluator.labels, dim=0).detach().cpu().numpy()
+            kt_evaluator.split_ids = torch.cat(kt_evaluator.split_ids, dim=0).detach().cpu().numpy()
+            kt_evaluator.states = torch.cat(kt_evaluator.states, dim=0).detach().cpu().numpy()
+            performance = kt_evaluator.compute_metrics() 
+
+            logging.info('-- {}/{} epoch, kt_performance: {}'.format(epoch_id, args.kt_train_epoch, performance))
+            
+            if performance['train']['roc'] > save_info['best_validation_performance']:
+                save_info['epoch'] = epoch_id
+                save_info['loss'] = epoch_loss
+                save_info['best_validation_performance'] = performance['train']['roc']
+                save_info['model_state_dict'] = deepcopy(model.state_dict())
+                save_info['optimizer_state_dict'] = deepcopy(optimizer.state_dict())
+
+                logging.info('saving best output to {}'.format(args.kt_best_result)) 
+
+                # kt_evaluator.write(args.kt_best_result)
+
+
+        '''
         if gpu_cnt > 1:
             logging.info('rank {} is writing output ...'.format(local_rank))
             kt_evaluator.write(args.kt_epoch_results_dir)
@@ -255,7 +319,7 @@ def train_kt(args, local_rank, gpu_cnt, device):
 
                 kt_evaluator.write(args.kt_best_epoch_dir)
         ## end epoch evaluation
-
+        '''
     logging.info('-- local rank {} finished training'.format(local_rank))
 
     if local_rank == 0:

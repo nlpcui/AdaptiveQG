@@ -9,7 +9,7 @@ from decimal import Decimal
 from nltk import word_tokenize
 from transformers import AutoModelForSeq2SeqLM, BartTokenizer, AutoConfig, AutoTokenizer
 from pprint import pprint
-
+from tqdm import tqdm
 
 class InteractionLog:
     def __init__(self):
@@ -536,7 +536,8 @@ class KTTokenizer:
         
         tokenized['word_attn_mask'] = self.build_word_attn_mask(tokenized)
         tokenized['w_l_tuple_attn_mask'] = self.build_w_l_tuple_attn_mask(tokenized)
-
+        tokenized['valid_length'] = len(tokenized['word_ids'])
+        tokenized['valid_interactions'] = len(tokenized['sep_indices'])
         return tokenized
     
     
@@ -548,11 +549,11 @@ class KTTokenizer:
             word_attn_mask[target_idx][target_idx] = False
             for source_idx in range(batch_max_seq_len): # column
                 # situation 2: words within same interaction == 1
-                if data['word_ids'][target_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['word_ids'][source_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
+                if data['word_ids'][target_idx] not in (self.word_sep_id, self.word_pad_id) and data['word_ids'][source_idx] not in (self.word_sep_id, self.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
                     # for pad word, word_id = -1
                     word_attn_mask[target_idx][source_idx] = False
                 # situation 3: <sep> with last interaction words == 1  
-                if data['word_ids'][target_idx] == tokenizer.word_sep_id and data['word_ids'][source_idx] != tokenizer.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
+                if data['word_ids'][target_idx] == self.word_sep_id and data['word_ids'][source_idx] != self.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
                     word_attn_mask[target_idx][source_idx] = False
         return word_attn_mask
 
@@ -560,19 +561,19 @@ class KTTokenizer:
         batch_max_seq_len = len(data['word_ids'])
         w_l_tuple_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
         for target_idx in range(batch_max_seq_len): # row
-            if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_pad_id:
+            if data['w_l_tuple_ids'][target_idx] == self.w_l_tuple_pad_id:
                 w_l_tuple_attn_mask[target_idx][target_idx] = False
             for source_idx in range(batch_max_seq_len): # column
                 # situation 1: (<sep> with <= self) =1
-                if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_sep_id and source_idx <= target_idx:
+                if data['w_l_tuple_ids'][target_idx] == self.w_l_tuple_sep_id and source_idx <= target_idx:
                     w_l_tuple_attn_mask[target_idx][source_idx] = False
                 # situation 2: target is word
-                if data['w_l_tuple_ids'][target_idx] not in (tokenizer.w_l_tuple_sep_id, tokenizer.w_l_tuple_pad_id):
+                if data['w_l_tuple_ids'][target_idx] not in (self.w_l_tuple_sep_id, self.w_l_tuple_pad_id):
                     # with ex-interactions =1
                     if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] >=0:
                         w_l_tuple_attn_mask[target_idx][source_idx] = False
                     # with last sep = 1
-                    if data['interaction_ids'][source_idx] == data['interaction_ids'][target_idx] and data['w_l_tuple_ids'][source_idx] == tokenizer.w_l_tuple_sep_id:
+                    if data['interaction_ids'][source_idx] == data['interaction_ids'][target_idx] and data['w_l_tuple_ids'][source_idx] == self.w_l_tuple_sep_id:
                         w_l_tuple_attn_mask[target_idx][source_idx] = False
         return w_l_tuple_attn_mask
 
@@ -663,23 +664,36 @@ class KTTokenizer:
 
 
 class DuolingoKTDataset(Dataset):
-    def __init__(self, data_file, tokenizer, max_lines=-1):
+    def __init__(self, data_file, tokenizer, raw=False, max_lines=-1):
 
         self.tokenizer = tokenizer
 
         self.data = []
 
         with open(data_file, 'r') as fp:
-            for idx, line in enumerate(fp.readlines()):
+            pbar = tqdm(total=2593)
+            line = fp.readline()
+            idx = 0
+            while line:
                 if idx >= max_lines > 0:
                     break
+                idx += 1
                 user_log = json.loads(line.strip())
-                tokenized = self.tokenizer(user_log)
-                self.data.append(tokenized)
-    
+                if raw:
+                    self.data.append(self.tokenizer(user_log))
+                else:
+                    self.data.append(user_log)
+                line = fp.readline()
+                pbar.update(1)
+            pbar.close() 
+
+    def dump_data(self, filename):
+        with open(filename, 'w') as fp:
+            for data in self.data:
+                fp.write(json.dumps(data)+'\n')   
 
     def __getitem__(self, idx):
-        return self.data[idx]['user_ids'], self.data[idx]['user_ability'], self.data[idx]['word_ids'], self.data[idx]['word_attn_masks'], self.data[idx]['w_l_tuple_ids'], self.data[idx]['w_l_tuple_attn_masks'], self.data[idx]['position_ids'], self.data[idx]['task_ids'], self.data[idx]['interaction_ids'], self.data[idx]['sep_indices'], self.data[idx]['labels'], self.data[idx]['split_ids']
+        return torch.tensor(self.data[idx]['user_id']), torch.tensor(self.data[idx]['user_ability']), torch.tensor(self.data[idx]['word_ids']), torch.tensor(self.data[idx]['valid_length']), torch.tensor(self.data[idx]['word_attn_mask']), torch.tensor(self.data[idx]['w_l_tuple_ids']), torch.tensor(self.data[idx]['w_l_tuple_attn_mask']), torch.tensor(self.data[idx]['position_ids']), torch.tensor(self.data[idx]['task_ids']), torch.tensor(self.data[idx]['interaction_ids']), torch.tensor(self.data[idx]['sep_indices']), torch.tensor(self.data[idx]['valid_interactions']), torch.tensor(self.data[idx]['labels']), torch.tensor(self.data[idx]['split_ids'])
 
     def construct_collate_fn(self, tokenizer, max_seq_len=None):
         

@@ -116,7 +116,7 @@ class QGEvaluator:
         
 
 class KTEvaluator:
-    def __init__(self, user_ids=[], user_abilities=[], logits=[], labels=[], states=[], split_ids=[], label_pad_id=-100):
+    def __init__(self, num_words, user_ids=[], user_abilities=[], logits=[], labels=[], states=[], split_ids=[], valid_length=[], valid_interactions=[], label_pad_id=-100):
         self.user_ids = user_ids
         self.user_abilities = user_abilities
         self.logits = logits
@@ -124,7 +124,9 @@ class KTEvaluator:
         self.states = states
         self.split_ids = split_ids
         self.label_pad_id = label_pad_id
-    
+        self.valid_length = valid_length
+        self.valid_interactions = valid_interactions 
+        self.num_words = num_words
 
     def compute_metrics(self):
         # ROC and F1 score
@@ -150,9 +152,9 @@ class KTEvaluator:
                 split_positions = np.where(self.split_ids[example_id] ==sid, True, False) # filter other splits
                 non_pad_positions = np.where(self.labels[example_id]>=0, True, False)   # filter pad labels
                 valid_positions = split_positions & non_pad_positions
-
+                 
                 if not valid_positions.any():
-                    logging.warning('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(self.user_ids[example_id]), split))
+                    logging.debug('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(self.user_ids[example_id]), split))
                     continue # no such split data
                 
 
@@ -168,6 +170,8 @@ class KTEvaluator:
             pbar.update(1)
         pbar.close()
         
+        logging.info('-- {} examples for evaluation; TRAIN: {} tokens; DEV: {} tokens; TEST: {} tokens.'.format(len(self.user_ids), len(collections['train']['labels']), len(collections['dev']['labels']), len(collections['test']['labels'])))        
+         
         for split in ['train', 'dev', 'test']:
             collections[split]['pred_labels'] = np.array(collections[split]['pred_labels'])
             collections[split]['labels'] = np.array(collections[split]['labels'])
@@ -208,19 +212,52 @@ class KTEvaluator:
         self.split_ids = np.array(self.split_ids)
         '''
 
-    def write(self, dir_name):
+    def write(self, filename):
+        fp = open(filename, 'w')
         pbar = tqdm(total=len(self.user_ids))         
         for idx in range(len(self.user_ids)):
+            
+            user_ability = self.user_abilities[idx].tolist()
+            user_id = self.user_ids[idx].tolist()
+            logits = self.logits[idx].tolist()[:self.valid_length[idx]]
+            labels = self.labels[idx].tolist()[:self.valid_length[idx]]
+            states = self.states[idx].tolist()[:self.valid_interactions[idx]]
+            states = torch.nn.functional.softmax(torch.tensor(states), dim=-1) # int_num, word_num, 2
+            states = states[:,:,1].numpy().tolist() # int_num, word_num, 1 
+            split_ids = self.split_ids[idx].tolist()[:self.valid_length[idx]]
+            ''' 
+            logging.info('interaction num raw is {}'.format(valid_int_positions.shape))
+            logging.info('logits shape {}'.format(self.logits[idx].shape))
+            logging.info('states shape {}'.format(self.states[idx].shape))
+            logging.info('logits to list {} {}'.format(self.logits[idx].tolist(), type(self.logits[idx].tolist()), len(self.logits[idx].tolist())))
+            logging.info('logits to list cut {} {}'.format(self.logits[idx].tolist()[:seq_len], type(self.logits[idx].tolist()[:seq_len]), len(self.logits[idx].tolist()[:seq_len])))
+            for i in range(len(states)):
+                logging.info('{}th state is {}'.format(i, states[i]))
+            logging.info('-- target logits {}'.format(logits))
+            logging.info('-- target labels {}'.format(labels))
+            logging.info('-- target splits {}'.format(split_ids))
+            logging.info('-- target states {}'.format(states))
+            logging.info('-- saving {}, seq_len {}, type {} interaction_num {}, type {}'.format(self.user_ids[idx], seq_len, type(seq_len), interaction_num, type(interaction_num))) 
+            logging.info('-- saving {}, logit len {}, labels len {}, states len {}, split_ids len {}'.format(self.user_ids[idx], len(logits), len(labels), len(states), len(split_ids))) 
+            new_states = self.states[idx][:self.valid_interactions[idx]]
+            logging.info('-- new states shape format{}'.format(new_states.shape))
+            new_logits = self.logits[idx][:self.valid_length[idx]]
+            logging.info('-- new logits shape format{}'.format(new_logits.shape))
+            exit(1)
+            seq_len = int(np.where(self.labels[idx]==-200, False, True).sum())
+            valid_int_positions = np.where((self.states[idx]==np.zeros([self.num_words, 2])).all(axis=1), False, True)
+            interaction_num = int(valid_int_positions.sum())
+            '''
             dump = {
-                'user_id': self.user_ids[idx].tolist(),
-                'user_ability': self.user_abilities[idx].tolist(),
-                'logits': self.logits[idx].tolist(),
-                'labels': self.labels[idx].tolist(),
-                'states': self.states[idx].tolist(),
-                'split_ids': self.split_ids[idx].tolist()
+                'user_id': user_id,
+                'user_ability': user_ability,
+                'logits': logits,
+                'labels': labels,
+                'states': states,
+                'split_ids': split_ids
             }
-            file_name = '-'.join(self.user_ids[idx].astype(np.str_).tolist())  # ascii_decode(self.user_ids[idx])
-            with open(os.path.join(dir_name, file_name), 'w') as fp:
-                fp.write(json.dumps(dump)+'\n')
+            fp.write(json.dumps(dump)+'\n')
             pbar.update(1)
         pbar.close()
+        fp.close()
+    
