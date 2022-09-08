@@ -10,6 +10,8 @@ from nltk import word_tokenize
 from transformers import AutoModelForSeq2SeqLM, BartTokenizer, AutoConfig, AutoTokenizer
 from pprint import pprint
 from tqdm import tqdm
+from scipy.sparse import coo_matrix
+
 
 class InteractionLog:
     def __init__(self):
@@ -170,22 +172,22 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
 
     ## compute user_ability -- correct_rate*ave_difficulty
     for user in user_interactions:
-        correct_rate = 0
+        error_cnt = 0
         difficulty_score = 0
 
         total_cnt = 0
         
         for split in ['train', 'dev', 'test']:
-            total_cnt += len(user_interactions[user][split])
             for interaction in user_interactions[user][split]:
+                total_cnt += len(interaction.exercise)
                 for item in interaction.exercise:
                     difficulty_score += word_map[item.text]['error_rate']
-                    correct_rate += item.label
+                    error_cnt += item.label
         
         difficulty_score /= total_cnt
-        correct_rate /= total_cnt
+        correct_rate = 1 - (error_cnt / total_cnt)
 
-        user_interactions[user]['user_ability'] = difficulty_score * correct_rate
+        user_interactions[user]['user_ability'] = (difficulty_score + correct_rate) / 2 # ave_word_difficulty * ave_word_correct_rate
 
     ## format data for knowledge tracing
     '''
@@ -687,13 +689,18 @@ class DuolingoKTDataset(Dataset):
                 pbar.update(1)
             pbar.close() 
 
+
     def dump_data(self, filename):
         with open(filename, 'w') as fp:
             for data in self.data:
+                print(sys.getsizeof(data['word_attn_mask']))
+                print(sys.getsizeof(coo_matrix(data['word_attn_mask'])))
                 fp.write(json.dumps(data)+'\n')   
+
 
     def __getitem__(self, idx):
         return torch.tensor(self.data[idx]['user_id']), torch.tensor(self.data[idx]['user_ability']), torch.tensor(self.data[idx]['word_ids']), torch.tensor(self.data[idx]['valid_length']), torch.tensor(self.data[idx]['word_attn_mask']), torch.tensor(self.data[idx]['w_l_tuple_ids']), torch.tensor(self.data[idx]['w_l_tuple_attn_mask']), torch.tensor(self.data[idx]['position_ids']), torch.tensor(self.data[idx]['task_ids']), torch.tensor(self.data[idx]['interaction_ids']), torch.tensor(self.data[idx]['sep_indices']), torch.tensor(self.data[idx]['valid_interactions']), torch.tensor(self.data[idx]['labels']), torch.tensor(self.data[idx]['split_ids'])
+
 
     def construct_collate_fn(self, tokenizer, max_seq_len=None):
         

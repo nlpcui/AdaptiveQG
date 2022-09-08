@@ -60,6 +60,7 @@ def train_kt(args, local_rank, gpu_cnt, device):
     
     dataset = DuolingoKTDataset(data_file=args.duolingo_en_es_format, tokenizer=tokenizer, raw=True, max_lines=16)
     dataset.dump_data(args.kt_format_data)
+    exit(1)
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
 
     # if local_rank == 0:
@@ -833,7 +834,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='euler_conf.ini')
+    parser.add_argument('--conf', type=str, default='local_conf.ini')
      
     args, remaining_argv = parser.parse_known_args()
     config = configparser.ConfigParser()
@@ -851,7 +852,7 @@ if __name__ == '__main__':
     logging.basicConfig(
         format='%(asctime)s %(message)s', 
         datefmt='%Y-%d-%m %I:%M:%S %p', 
-        filename=args.kt_train_log, 
+        # filename=args.kt_train_log, 
         level=logging.INFO, 
         filemode='a'
     )

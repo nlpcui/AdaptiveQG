@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 
 class QGEvaluator:
-    def __init__(self, word_file, prompt_words, generated, reference, difficulty_scores, difficulty_levels):
+    def __init__(self, word_file):
 
         self.word_difficulty = {}
         df = pd.read_csv(word_file)
@@ -20,11 +20,11 @@ class QGEvaluator:
         
         # logging.info('-- word_difficulty {}'.format(self.word_difficulty))
         
-        self.prompt_words = prompt_words
-        self.generated = generated
-        self.reference = reference
-        self.difficulty_scores = difficulty_scores
-        self.difficulty_levels = difficulty_levels
+        self.prompt_words = []
+        self.generated = []
+        self.reference = []
+        self.difficulty_scores = []
+        self.difficulty_levels = []
         self.generated_difficulty_scores = []
         self.generated_difficulty_levels = []
 
@@ -33,6 +33,20 @@ class QGEvaluator:
 
         self.rouge_scores = []
         self.coverage = []
+
+
+    def read(self, filename):
+        with open(filename, 'r') as fp:
+            for line in fp.readlines():
+                data = json.loads(line.strip())
+                self.prompt_words.append(self.tokenizer(data['prompt_words']))
+                self.generated.append(data['generated'])
+                self.reference.append(data['reference'])
+                self.difficulty_levels.append(data['difficulty_level'])
+                self.difficulty_scores.append(data['difficulty_score'])
+                self.generated_difficulty_scores.append(data['generated_difficulty_score'])
+                self.generated_difficulty_levels.append(data['generated_difficulty_level'])
+
 
     def compute_metrics(self):
         result = {}
@@ -114,6 +128,19 @@ class QGEvaluator:
             for idx in range(len(self.prompt_words)):
                 fp.write(json.dumps({'prompt_words': self.prompt_words[idx], 'difficulty_score': self.difficulty_scores[idx], 'difficulty_level': self.difficulty_levels[idx], 'generated': self.generated[idx], 'reference': self.reference[idx], 'generated_difficulty_score': self.generated_difficulty_scores[idx], 'generated_difficulty_level': self.generated_difficulty_levels[idx]})+'\n')
         
+
+    def update_difficulty(self):
+        # update difficulty using cur word file
+        for idx in range(len(self.generated)):
+            words = self.tokenizer(self.reference[idx])
+            new_diff = 0
+            for word in words:
+                if word not in self.word_difficulty:
+                    continue
+                new_diff += self.word_difficulty[word]
+
+            self.difficulty_scores[idx] = new_diff
+
 
 class KTEvaluator:
     def __init__(self, num_words, user_ids=[], user_abilities=[], logits=[], labels=[], states=[], split_ids=[], valid_length=[], valid_interactions=[], label_pad_id=-100):
