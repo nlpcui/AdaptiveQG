@@ -1,5 +1,5 @@
 import sys, os, json, configparser, argparse, datetime, logging, math
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3' # "3,4,6,7"
 import torch
 from tqdm import tqdm
 from process_data import *
@@ -30,17 +30,16 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
     logging.info('-- local_rank: {}, building dataset ...'.format(local_rank))
     
     dataset = DuolingoKTDataset(
-        raw_data_file=args.duolingo_en_es_format,
-        data_dir=args.kt_format_data,
+        raw_data_file=None, #args.duolingo_en_es_format,
+        data_dir=args.kt_format_data_2048,
         word_file=args.duolingo_en_es_word_file, 
         w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
         max_seq_len=args.kt_max_seq_len,
         label_pad_id=int(args.kt_pad_label_id),
         target_split=['train', 'dev', 'test'],
-        max_lines=-1
+        max_lines=100
     )
 
-    exit(1)
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
 
     model = KnowledgeTracer(
@@ -75,7 +74,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             batch_size=args.kt_train_batch_size, 
             collate_fn=dataset.construct_collate_fn(max_seq_len=args.kt_max_seq_len),
             sampler=sampler
-    	)
+        )
     else:
         dataloader = DataLoader(
             dataset,
@@ -219,8 +218,8 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             lr_scheduler.step()
             
             logging.info('-- local_rank: {} In {}/{} epoch, {}/{} batch, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, loss))
+            
             exit(1)
-        
 
         
         model.eval()
@@ -318,7 +317,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
                 dist.all_gather(batch_valid_length, x_valid_length)
                 dist.all_gather(batch_valid_interactions, x_valid_interactions)
 
-                for bid in range(batch_size)
+                for bid in range(batch_size):
                     KTEvaluator.add(
                         user_id=batch_user_ids[bid].numpy(), 
                         user_ability=batch_user_abilities[bid].numpy(), 
@@ -354,8 +353,8 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
     if local_rank == 0:
         logging.info('-- local rank 0: best model: {}-th epoch, loss: {}, best_performance: {}'.format(save_info['epoch'], save_info['loss'], save_info['best_performance']))
         
-        logging.info('-- local rank 0: saving best epoch results to {}'.format(args.kt_best_epoch_dir))
-        kt_evaluator.save(args.kt_best_epoch_dir)
+        logging.info('-- local rank 0: saving best epoch results to {}'.format(args.kt_best_epoch_result))
+        kt_evaluator.save(args.kt_best_epoch_result)
         logging.info('-- local rank 0: best epoch results saved!')
 
         logging.info('-- local rank 0: saving best model to {} ...'.format(model_save_path))
@@ -868,7 +867,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='local_conf.ini')
+    parser.add_argument('--conf', type=str, default='euler_conf.ini')
      
     args, remaining_argv = parser.parse_known_args()
     config = configparser.ConfigParser()
@@ -886,7 +885,7 @@ if __name__ == '__main__':
     logging.basicConfig(
         format='%(asctime)s %(message)s', 
         datefmt='%Y-%d-%m %I:%M:%S %p', 
-        # filename=args.kt_train_log, 
+        filename=args.kt_train_log, 
         level=logging.INFO, 
         filemode='a'
     )

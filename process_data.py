@@ -470,9 +470,10 @@ class DuolingoKTDataset(Dataset):
         self.interaction_pad_id = interaction_pad_id
 
         self.word_map = {
-            '<bos>': 0,
-            '<eos>': 1,
-            '<unk>': 2
+            '<pad>': 0,
+            '<bos>': 1,
+            '<eos>': 2,
+            '<unk>': 3
         }
         special_word_num = len(self.word_map)
         df_words = pd.read_csv(word_file)
@@ -480,9 +481,10 @@ class DuolingoKTDataset(Dataset):
             self.word_map[row['word']] = int(row['word_id']) + special_word_num
         
         self.w_l_tuple_map = {
-            '<bos>': 0,
-            '<eos>': 1,
-            '<unk>': 2
+            '<pad>': 0,
+            '<bos>': 1,
+            '<eos>': 2,
+            '<unk>': 3
         }
         special_w_l_tuple_num = len(self.w_l_tuple_map)
         df_w_l_tuples = pd.read_csv(w_l_tuple_file)
@@ -514,7 +516,11 @@ class DuolingoKTDataset(Dataset):
 
         self.data = []
         logging.info('loading data from {}'.format(data_dir))
+        line_cnt = 0
         for filename in tqdm(os.listdir(data_dir)):
+            line_cnt += 1
+            if line_cnt >= max_lines > 0:
+                break
             data = np.load(os.path.join(data_dir, filename))
             self.data.append({key: data[key] for key in data})
             # print(sizeof(self.data[-1])/1024/1024)
