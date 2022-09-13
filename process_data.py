@@ -11,6 +11,8 @@ from transformers import AutoModelForSeq2SeqLM, BartTokenizer, AutoConfig, AutoT
 from pprint import pprint
 from tqdm import tqdm
 from scipy.sparse import coo_matrix
+from utils import *
+from pprint import pprint
 
 
 class InteractionLog:
@@ -114,16 +116,8 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
         return
     
     user_interactions = {}
-    word_map = {
-        '<pad>': {'word': '<pad>', 'word_id': 0, 'cnt': 0, 'error_cnt': 0},
-        '<sep>': {'word': '<sep>', 'word_id': 1, 'cnt': 0, 'error_cnt': 0},
-        '<unk>': {'word': '<unk>', 'word_id': 2, 'cnt': 0, 'error_cnt': 0},
-    } 
-    w_l_tuple_map = {
-        '<pad>': {'w_l_tuple': '<pad>', 'w_l_tuple_id': 0, 'cnt': 0},
-        '<sep>': {'w_l_tuple': '<sep>', 'w_l_tuple_id': 1, 'cnt': 0},
-        '<unk>': {'w_l_tuple': '<unk>', 'w_l_tuple_id': 2, 'cnt': 0},
-    } # w_l_tuple, id, freq
+    word_map = {} 
+    w_l_tuple_map = {} # w_l_tuple, id, freq
     exercise_map = {} # exercise, freq, correct_cnt, error_cnt, average_num_errors
 
     # read train
@@ -343,6 +337,7 @@ def get_statistics(data_file, target_split=None):
         'interaction_num_distribution': {},          # interaction per user
         'max_interaction_num': float('-inf'),
         'min_interaction_num': float('inf'),
+        'avg_interaction_num': .0,
         
         'interaction_length_distribution': {},       # wor per interaction 
         'interaction_max_length': float('-inf'),
@@ -351,6 +346,7 @@ def get_statistics(data_file, target_split=None):
         'length_distribution': {},                   # word per user
         'max_length': float('-inf'),                  
         'min_length': float('inf'),
+        'avg_length': .0
     }
 
     with open(data_file, 'r') as fp:
@@ -416,26 +412,11 @@ def get_statistics(data_file, target_split=None):
 
 
 
-def ascii_encode(x):
-    # str => int list 
-    result = []
-    for char in x:
-        result.append(ord(char))
-    return result
-
-def ascii_decode(x):
-    # int list => str
-    result = []
-    for number in x:
-        result.append(chr(number))
-    return ''.join(result)
-
-
 class KTTokenizer:
     def __init__(self, word_file, w_l_tuple_file, max_seq_len, label_pad_id=-100, target_split=['train']):
         
         self.max_seq_len = max_seq_len
-        self.label_pad_id = -100
+        self.label_pad_id = label_pad_id
         self.target_split = target_split
 
         self.word_map = {}
@@ -480,197 +461,67 @@ class KTTokenizer:
         self.num_tasks = len(self.task_map)
 
 
-    def __call__(self, user_log, padding=False, truncation=False):
+class DuolingoKTDataset(Dataset):
+    def __init__(self, raw_data_file, data_dir, word_file, w_l_tuple_file, max_seq_len, target_split, label_pad_id=-100, interaction_pad_id=-100, max_lines=-1):
+        
+        self.max_seq_len = max_seq_len
+        self.label_pad_id = label_pad_id
+        self.target_split = target_split
+        self.interaction_pad_id = interaction_pad_id
 
-        # begining token <sep>
-
-        tokenized = {
-            'user_id': ascii_encode(user_log['user_id']),
-            'user_ability': user_log['user_ability'],
-            'word_ids': [],
-            'w_l_tuple_ids': [],
-            'task_ids': [],
-            'interaction_ids': [],
-            'sep_indices': [],
-            'labels': [],
-            'split_ids': [],
-            'position_ids': []
+        self.word_map = {
+            '<bos>': 0,
+            '<eos>': 1,
+            '<unk>': 2
+        }
+        special_word_num = len(self.word_map)
+        df_words = pd.read_csv(word_file)
+        for idx, row in df_words.iterrows():
+            self.word_map[row['word']] = int(row['word_id']) + special_word_num
+        
+        self.w_l_tuple_map = {
+            '<bos>': 0,
+            '<eos>': 1,
+            '<unk>': 2
+        }
+        special_w_l_tuple_num = len(self.w_l_tuple_map)
+        df_w_l_tuples = pd.read_csv(w_l_tuple_file)
+        for idx, row in df_w_l_tuples.iterrows():
+            self.w_l_tuple_map[row['w_l_tuple']] = int(row['w_l_tuple_id']) + special_w_l_tuple_num
+        
+        self.task_map = {
+            '<pad>': 0,
+            'reverse_translate': 1,
+            'reverse_tap': 2,
+            'listen': 3
         }
 
-        tokenized['word_ids'].append(self.word_sep_id)
-        tokenized['w_l_tuple_ids'].append(self.w_l_tuple_sep_id)
-        tokenized['task_ids'].append(self.task_pad_id)
-        tokenized['interaction_ids'].append(0)
-        tokenized['sep_indices'].append(0)
-        tokenized['labels'].append(self.label_pad_id)
-        tokenized['split_ids'].append(self.split_pad_id)
-
-        for split in ['train', 'dev', 'test']:
-            if self.target_split and split not in self.target_split:
-                continue 
-            for interaction_id, interaction in enumerate(user_log[split]):
-                for idx, item in enumerate(interaction['exercise']):
-                    tokenized['word_ids'].append(self.word_map.get(item['text'], self.word_unk_id))
-                    tokenized['w_l_tuple_ids'].append(self.w_l_tuple_map.get('{}|{}'.format(item['text'], item['label']), self.w_l_tuple_unk_id))
-                    tokenized['task_ids'].append(self.task_map[interaction['format']])
-                    tokenized['interaction_ids'].append(interaction_id)
-                    tokenized['labels'].append(item['label'])
-                    tokenized['split_ids'].append(self.split_map[split])
-
-                # <sep> in the end of each interaction
-                tokenized['word_ids'].append(self.word_sep_id)
-                tokenized['w_l_tuple_ids'].append(self.w_l_tuple_sep_id)
-                tokenized['task_ids'].append(self.task_pad_id)
-                tokenized['interaction_ids'].append(interaction_id+1)
-
-                tokenized['labels'].append(self.label_pad_id)
-                tokenized['split_ids'].append(self.split_map[split])
-
-        tokenized['position_ids'] = [i for i in range(len(tokenized['word_ids']))]
-        tokenized['sep_indices'] = [idx for idx in range(len(tokenized['word_ids'])) if tokenized['word_ids'][idx]==self.word_sep_id]
-
-        ## when truncation words, adjust <sep> indices and pad if needed
-        if truncation and len(tokenized['word_ids']) > self.max_seq_len:
-            self.truncate(tokenized)
-
-        # if padding and len(tokenized['word_ids']) < self.max_seq_len:
-        #     self.pad(tokenized)
-        
-        tokenized['word_attn_mask'] = self.build_word_attn_mask(tokenized)
-        tokenized['w_l_tuple_attn_mask'] = self.build_w_l_tuple_attn_mask(tokenized)
-        tokenized['valid_length'] = len(tokenized['word_ids'])
-        tokenized['valid_interactions'] = len(tokenized['sep_indices'])
-        return tokenized
-    
-    
-    def build_word_attn_mask(self, data):
-        batch_max_seq_len = len(data['word_ids'])
-        word_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
-        for target_idx in range(batch_max_seq_len): # row
-            # situation 1: diagnol always == 1
-            word_attn_mask[target_idx][target_idx] = False
-            for source_idx in range(batch_max_seq_len): # column
-                # situation 2: words within same interaction == 1
-                if data['word_ids'][target_idx] not in (self.word_sep_id, self.word_pad_id) and data['word_ids'][source_idx] not in (self.word_sep_id, self.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
-                    # for pad word, word_id = -1
-                    word_attn_mask[target_idx][source_idx] = False
-                # situation 3: <sep> with last interaction words == 1  
-                if data['word_ids'][target_idx] == self.word_sep_id and data['word_ids'][source_idx] != self.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
-                    word_attn_mask[target_idx][source_idx] = False
-        return word_attn_mask
-
-    def build_w_l_tuple_attn_mask(self, data):
-        batch_max_seq_len = len(data['word_ids'])
-        w_l_tuple_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
-        for target_idx in range(batch_max_seq_len): # row
-            if data['w_l_tuple_ids'][target_idx] == self.w_l_tuple_pad_id:
-                w_l_tuple_attn_mask[target_idx][target_idx] = False
-            for source_idx in range(batch_max_seq_len): # column
-                # situation 1: (<sep> with <= self) =1
-                if data['w_l_tuple_ids'][target_idx] == self.w_l_tuple_sep_id and source_idx <= target_idx:
-                    w_l_tuple_attn_mask[target_idx][source_idx] = False
-                # situation 2: target is word
-                if data['w_l_tuple_ids'][target_idx] not in (self.w_l_tuple_sep_id, self.w_l_tuple_pad_id):
-                    # with ex-interactions =1
-                    if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] >=0:
-                        w_l_tuple_attn_mask[target_idx][source_idx] = False
-                    # with last sep = 1
-                    if data['interaction_ids'][source_idx] == data['interaction_ids'][target_idx] and data['w_l_tuple_ids'][source_idx] == self.w_l_tuple_sep_id:
-                        w_l_tuple_attn_mask[target_idx][source_idx] = False
-        return w_l_tuple_attn_mask
-
-    def pad(self, tokenized, max_seq_len=None, max_interaction_num=None):
-        max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
-        
-        seq_pad_length = max_seq_len - len(tokenized['word_ids'])
-        if seq_pad_length > 0:
-            tokenized['position_ids'].extend([idx for idx in range(len(tokenized['word_ids']), max_seq_len)])
-            tokenized['word_ids'].extend([self.word_pad_id for i in range(seq_pad_length)])
-            tokenized['w_l_tuple_ids'].extend([self.w_l_tuple_pad_id for i in range(seq_pad_length)])
-            tokenized['task_ids'].extend([self.task_pad_id for i in range(seq_pad_length)])
-            tokenized['interaction_ids'].extend([-1 for i in range(seq_pad_length)])
-            tokenized['labels'].extend([self.label_pad_id for i in range(seq_pad_length)])
-            tokenized['split_ids'].extend([self.split_pad_id for i in range(seq_pad_length)])
-        
-        if max_interaction_num:
-            sep_indices_pad_length = max_interaction_num - len(tokenized['sep_indices'])
-            if sep_indices_pad_length > 0:
-                tokenized['sep_indices'].extend([-1 for i in range(sep_indices_pad_length)]) # sep pad with -1
+        self.split_map = {
+            '<pad>': 0,
+            'train': 1,
+            'dev': 2,
+            'test': 3 
+        }
 
 
-    def truncate(self, tokenized, max_seq_len=None, debug=False):
-        
-        max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
+        self.num_words = len(self.word_map)
+        self.num_w_l_tuples = len(self.w_l_tuple_map)
+        self.num_tasks = len(self.task_map)
 
+        if raw_data_file:
+            self.build_dataset(raw_data_file, data_dir, max_lines)
 
-        trunc_length = len(tokenized['word_ids']) - max_seq_len
-
-        if trunc_length <= 0:
-            return
-
-        if tokenized['word_ids'][trunc_length+1] == self.word_sep_id:
-            # print('drop first')
-            # skip the first token and start with the next <sep> token to avoid "<sep><sep>" start
-            trunc_length += 1
-            tokenized['word_ids'] = tokenized['word_ids'][trunc_length: ]
-            tokenized['w_l_tuple_ids'] = tokenized['w_l_tuple_ids'][trunc_length: ]
-            tokenized['task_ids'] = tokenized['task_ids'][trunc_length: ]
-
-            tokenized['labels'] = tokenized['labels'][trunc_length: ]
-            tokenized['split_ids'] = tokenized['split_ids'][trunc_length: ]
-            tokenized['position_ids'] = [i for i in range(len(tokenized['word_ids']))]
-            
-            # reconstruct sep indices            
-            tokenized['sep_indices'] = [idx for idx in range(len(tokenized['word_ids'])) if tokenized['word_ids'][idx]==self.word_sep_id]
-
-            # reconstruct interaction_ids
-            interaction_id = -1
-            tokenized['interaction_ids'] = []
-            for i in range(len(tokenized['word_ids'])):
-                if tokenized['word_ids'][i] == self.word_sep_id:
-                    interaction_id += 1
-                tokenized['interaction_ids'].append(interaction_id)
-            
-            self.pad(tokenized) # pad one position in the end
-        else:
-            # print('not drop first')
-            tokenized['word_ids'] = tokenized['word_ids'][trunc_length: ]
-            tokenized['w_l_tuple_ids'] = tokenized['w_l_tuple_ids'][trunc_length: ]
-            tokenized['task_ids'] = tokenized['task_ids'][trunc_length: ]
-
-            tokenized['labels'] = tokenized['labels'][trunc_length: ]
-            tokenized['split_ids'] = tokenized['split_ids'][trunc_length: ]
-            tokenized['position_ids'] = [i for i in range(len(tokenized['word_ids']))]
-
-            # reset first token
-            tokenized['word_ids'][0] = self.word_sep_id
-            tokenized['w_l_tuple_ids'][0] = self.w_l_tuple_sep_id
-            tokenized['task_ids'][0] = self.task_pad_id
-            tokenized['interaction_ids'][0] = 0
-            tokenized['sep_indices'][0] = 0
-            tokenized['labels'][0] = self.label_pad_id
-            tokenized['split_ids'][0] = self.split_pad_id
-
-            # reconstruct sep indices            
-            tokenized['sep_indices'] = [idx for idx in range(len(tokenized['word_ids'])) if tokenized['word_ids'][idx]==self.word_sep_id]
-
-            # reconstruct interaction_ids
-            tokenized['interaction_ids'] = []
-            interaction_id = -1
-            for i in range(len(tokenized['word_ids'])):
-                if tokenized['word_ids'][i] == self.word_sep_id:
-                    interaction_id += 1
-                tokenized['interaction_ids'].append(interaction_id)
-
-
-
-
-class DuolingoKTDataset(Dataset):
-    def __init__(self, data_file, tokenizer, raw=False, max_lines=-1):
-
-        self.tokenizer = tokenizer
 
         self.data = []
+        logging.info('loading data from {}'.format(data_dir))
+        for filename in tqdm(os.listdir(data_dir)):
+            data = np.load(os.path.join(data_dir, filename))
+            self.data.append({key: data[key] for key in data})
+            # print(sizeof(self.data[-1])/1024/1024)
+        
+
+    def build_dataset(self, data_file, dirname, max_lines=-1):
+        logging.info('read data from {}, serialize data to {}...'.format(data_file, dirname))
 
         with open(data_file, 'r') as fp:
             pbar = tqdm(total=2593)
@@ -681,113 +532,242 @@ class DuolingoKTDataset(Dataset):
                     break
                 idx += 1
                 user_log = json.loads(line.strip())
-                if raw:
-                    self.data.append(self.tokenizer(user_log))
-                else:
-                    self.data.append(user_log)
+                format_data = self.format(user_log)
+                filename = '{}.npz'.format('-'.join([str(num) for num in format_data['user_id']]))
+                save_path = os.path.join(dirname, filename)
+                np.savez(save_path, **format_data) 
                 line = fp.readline()
                 pbar.update(1)
             pbar.close() 
 
 
-    def dump_data(self, filename):
-        with open(filename, 'w') as fp:
-            for data in self.data:
-                print(sys.getsizeof(data['word_attn_mask']))
-                print(sys.getsizeof(coo_matrix(data['word_attn_mask'])))
-                fp.write(json.dumps(data)+'\n')   
+    def format(self, user_log, padding=False, truncation=True):
+        # format SINGLE user_log to train data
+        instance = {
+            'user_id': ascii_encode(user_log['user_id']),
+            'user_ability': [user_log['user_ability']],
+            'word_ids': [],
+            'word_attn_mask': None,
+            'w_l_tuple_ids': [],
+            'w_l_tuple_attn_mask': None,
+            'position_ids': [],
+            'task_ids': [],
+            'interaction_ids': [],
+            'labels': [],
+            'split_ids': [],
+        }
+
+        instance['word_ids'].append(self.word_map['<bos>'])
+        instance['w_l_tuple_ids'].append(self.w_l_tuple_map['<bos>'])
+        instance['task_ids'].append(self.task_map['<pad>'])
+        instance['interaction_ids'].append(-1)
+        instance['labels'].append(self.label_pad_id)
+        instance['split_ids'].append(self.split_map['<pad>'])
+
+        cur_interaction_id = 0
+        # words = []
+        for split in ['train', 'dev', 'test']:
+            if self.target_split and split not in self.target_split:
+                continue 
+            for interaction_id, interaction in enumerate(user_log[split]):
+                for idx, item in enumerate(interaction['exercise']):
+                    # words.append(item['text'])
+                    instance['word_ids'].append(self.word_map.get(item['text'], self.word_map['<unk>']))
+                    instance['w_l_tuple_ids'].append(self.w_l_tuple_map.get('{}|{}'.format(item['text'], item['label']), self.w_l_tuple_map['<unk>']))
+                    instance['task_ids'].append(self.task_map[interaction['format']])
+                    instance['labels'].append(item['label'])
+                    instance['split_ids'].append(self.split_map[split])
+                    instance['interaction_ids'].append(cur_interaction_id)
+                
+                cur_interaction_id += 1
+
+        instance['word_ids'].append(self.word_map['<eos>'])
+        instance['w_l_tuple_ids'].append(self.w_l_tuple_map['<eos>'])
+        instance['task_ids'].append(self.task_map['<pad>'])
+        instance['interaction_ids'].append(cur_interaction_id)
+        instance['split_ids'].append(self.split_map['<pad>'])
+        instance['labels'].append(self.label_pad_id)
+
+        instance['position_ids'] = [i for i in range(len(instance['word_ids']))]
+
+        if truncation and len(instance['word_ids']) > self.max_seq_len:
+            self.truncate(instance)
+
+        if padding and len(tokenized['word_ids']) < self.max_seq_len:
+            self.pad(tokenized)
+        
+        instance['word_attn_mask'] = self.__build_word_attn_mask(instance)
+        instance['w_l_tuple_attn_mask'] = self.__build_w_l_tuple_attn_mask(instance)
+        instance['valid_length'] = [len(instance['word_ids'])]
+        instance['valid_interactions'] = [instance['interaction_ids'][-1]]
+
+        # words = words[-self.max_seq_len+2:]
+        # print(words)
+        # for key in instance:
+        #     print(key)
+        #     if key == 'word_attn_mask' or key == 'w_l_tuple_attn_mask':
+        #         for row in instance[key]:
+        #             print(row)
+        #     else:
+        #         print(instance[key])
+
+        for key in instance:
+            instance[key] = np.array(instance[key])
+
+        return instance
+
+
+    def __build_word_attn_mask(self, data):
+        seq_len = len(data['word_ids'])
+        word_attn_mask = [[True for i in range(seq_len)] for j in range(seq_len)]
+        
+        for target_idx in range(seq_len): # row
+            for source_idx in range(seq_len): # column
+                if data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
+                    word_attn_mask[target_idx][source_idx] = False
+                # elif data['interaction_ids'][target_idx] < data['interaction_ids'][source_idx]:
+                #     break
+        
+        return word_attn_mask
+
+    
+    def __build_w_l_tuple_attn_mask(self, data):
+        seq_len = len(data['word_ids'])
+        w_l_tuple_attn_mask = [[True for i in range(seq_len)] for j in range(seq_len)]
+        
+        for target_idx in range(seq_len): # row
+            if target_idx == 0:
+                w_l_tuple_attn_mask[0][0] = False
+            elif target_idx == seq_len -1:
+                w_l_tuple_attn_mask[target_idx] = [False for i in range(seq_len)]
+            else:
+                for source_idx in range(seq_len): # column
+                    if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx]:
+                        w_l_tuple_attn_mask[target_idx][source_idx] = False
+                    elif data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx] == self.interaction_pad_id:
+                        w_l_tuple_attn_mask[target_idx][source_idx] == False
+
+        return w_l_tuple_attn_mask
+
+
+    def __build_memory_update_mask(self, data):
+        memory_update_mask = [[0 for i in range(len(data['word_ids']))] for j in range(len(data['word_ids']))]
+        for column_id in range(data['sep_indices']):
+            if data['sep_indices'][column_id] == 0:
+                continue
+            
+            memory_update_mask[column_id][column_id] == 1
+            
+            for row_id in range(column_id):
+                if data['sep_indices'] == 1:
+                    memory_update_mask[row_id][column_id] == 1
+                    
+        return memory_update_mask
 
 
     def __getitem__(self, idx):
-        return torch.tensor(self.data[idx]['user_id']), torch.tensor(self.data[idx]['user_ability']), torch.tensor(self.data[idx]['word_ids']), torch.tensor(self.data[idx]['valid_length']), torch.tensor(self.data[idx]['word_attn_mask']), torch.tensor(self.data[idx]['w_l_tuple_ids']), torch.tensor(self.data[idx]['w_l_tuple_attn_mask']), torch.tensor(self.data[idx]['position_ids']), torch.tensor(self.data[idx]['task_ids']), torch.tensor(self.data[idx]['interaction_ids']), torch.tensor(self.data[idx]['sep_indices']), torch.tensor(self.data[idx]['valid_interactions']), torch.tensor(self.data[idx]['labels']), torch.tensor(self.data[idx]['split_ids'])
-
-
-    def construct_collate_fn(self, tokenizer, max_seq_len=None):
+        return self.data[idx] # user_id, user_ability, word_ids, word_attn_mask, w_l_tuple_ids, x_w_l_tuple_attn_mask, position_ids, task_ids, interaction_ids, labels, split_ids, valid_length, valid_interactions
         
-        def collate_fn(batch_data):
-            batch_max_interactions = max([len(data['sep_indices']) for data in batch_data])
 
-            batch_max_seq_len = max([len(data['word_ids']) for data in batch_data])
-
-            # logging.info('-- collate, {} examples, batch_max_seq_len {}'.format(len(batch_data), batch_max_seq_len))
-            if max_seq_len and max_seq_len < batch_max_seq_len:
-                batch_max_seq_len = max_seq_len
-
-            user_ids = [data['user_id'] for data in batch_data]
-
-            # align batch
-            for data in batch_data:
-                tokenizer.truncate(data, max_seq_len=batch_max_seq_len, debug=True)
-                tokenizer.pad(data, max_seq_len=batch_max_seq_len, max_interaction_num=batch_max_interactions)
-            
-            x_user_ids = torch.tensor([data['user_id'] for data in batch_data])
-            x_user_abilities = torch.tensor([data['user_ability'] for data in batch_data])
-            x_word_ids = torch.tensor([data['word_ids'] for data in batch_data])
-            x_w_l_tuple_ids = torch.tensor([data['w_l_tuple_ids'] for data in batch_data])
-            x_position_ids = torch.tensor([data['position_ids'] for data in batch_data])
-            x_task_ids = torch.tensor([data['task_ids'] for data in batch_data])
-            x_interaction_ids = torch.tensor([data['interaction_ids'] for data in batch_data])
-            x_sep_indices = torch.tensor([data['sep_indices'] for data in batch_data])
-            y_labels = torch.tensor([data['labels'] for data in batch_data])
-            split_ids = torch.tensor([data['split_ids'] for data in batch_data]) # 0 train, 1 dev, 2 test
-
-            # build word attn mask, [batch_size, target_L, source_L]
-            x_word_attn_masks = []
-            for data in batch_data:
-                word_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
-                for target_idx in range(batch_max_seq_len): # row
-                    # situation 1: diagnol always == 1
-                    word_attn_mask[target_idx][target_idx] = False
-                    for source_idx in range(batch_max_seq_len): # column
-                        # situation 2: words within same interaction == 1
-                        if data['word_ids'][target_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['word_ids'][source_idx] not in (tokenizer.word_sep_id, tokenizer.word_pad_id) and data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
-                            # for pad word, word_id = -1
-                            word_attn_mask[target_idx][source_idx] = False
-                        # situation 3: <sep> with last interaction words == 1  
-                        if data['word_ids'][target_idx] == tokenizer.word_sep_id and data['word_ids'][source_idx] != tokenizer.word_sep_id and data['interaction_ids'][target_idx] - data['interaction_ids'][source_idx] == 1:
-                            word_attn_mask[target_idx][source_idx] = False
-
-                x_word_attn_masks.append(word_attn_mask)
-            x_word_attn_masks = torch.tensor(x_word_attn_masks)
-
-            # build tuple attn mask, [batch_size, max_seq_len, max_seq_len]
-            x_w_l_tuple_attn_masks = []
-            for data in batch_data:
-                w_l_tuple_attn_mask = [[True for i in range(batch_max_seq_len)] for j in range(batch_max_seq_len)]
-                for target_idx in range(batch_max_seq_len): # row
-                    if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_pad_id:
-                        w_l_tuple_attn_mask[target_idx][target_idx] = False
-                    for source_idx in range(batch_max_seq_len): # column
-                        # situation 1: (<sep> with <= self) =1
-                        if data['w_l_tuple_ids'][target_idx] == tokenizer.w_l_tuple_sep_id and source_idx <= target_idx:
-                            w_l_tuple_attn_mask[target_idx][source_idx] = False
-                        # situation 2: target is word
-                        if data['w_l_tuple_ids'][target_idx] not in (tokenizer.w_l_tuple_sep_id, tokenizer.w_l_tuple_pad_id):
-                            # with ex-interactions =1
-                            if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] >=0:
-                                w_l_tuple_attn_mask[target_idx][source_idx] = False
-                            # with last sep = 1
-                            if data['interaction_ids'][source_idx] == data['interaction_ids'][target_idx] and data['w_l_tuple_ids'][source_idx] == tokenizer.w_l_tuple_sep_id:
-                                w_l_tuple_attn_mask[target_idx][source_idx] = False
-
-
-                x_w_l_tuple_attn_masks.append(w_l_tuple_attn_mask)            
-            x_w_l_tuple_attn_masks = torch.tensor(x_w_l_tuple_attn_masks)
-            
-            return x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices, y_labels, split_ids
-
+    def pad(self, tokenized, max_seq_len=None, direction='left'):
+        # only pad word_ids and w_l_tuple_ids, not to pad sep_indices
+        max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
         
-        return collate_fn
+        seq_pad_length = max_seq_len - len(tokenized['word_ids'])
 
+        if seq_pad_length <= 0:
+            return 
+        
+        pad_word_ids = [self.word_map['<pad>'] for i in range(seq_pad_length)]
+        pad_w_l_tuple_ids = [self.w_l_tuple_map['<pad>'] for i in range(seq_pad_length)]
+        pad_task_ids = [self.task_map['<pad>'] for i in range(seq_pad_length)]
+        pad_labels = [self.label_pad_id for i in range(seq_pad_length)]
+        pad_split_ids = [self.split_map['<pad>'] for i in range(seq_pad_length)]
+        pad_interaction_ids = [self.interaction_pad_id for i in range(seq_pad_length)] # TODO: 是否-100 做填充？
 
-    # def __getitem__(self, idx):
-    #    return self.data[idx]
+        if direction == 'right':
+            tokenized['word_ids'] += pad_word_ids
+            tokenized['w_l_tuple_ids'] += pad_w_l_tuple_ids
+            tokenized['task_ids'] += pad_task_ids
+            tokenized['labels'] += pad_labels
+            tokenized['split_ids'] += pad_split_ids
+            tokenized['interaction_ids'] += pad_interaction_ids
+        elif direction == 'left':
+            tokenized['word_ids'] = pad_word_ids + tokenized['word_ids']
+            tokenized['w_l_tuple_ids'] = pad_w_l_tuple_ids + tokenized['w_l_tuple_ids']
+            tokenized['task_ids'] = pad_task_ids + tokenized['task_ids']
+            tokenized['labels'] = pad_labels + tokenized['labels']
+            tokenized['split_ids'] = pad_split_ids + tokenized['split_ids']
+            tokenized['interaction_ids'] = pad_interaction_ids + tokenized['interaction_ids']
+
+        tokenized['position_ids'] = [i for i in range(len(tokenized['position_ids']))]
+        
+
+    def truncate(self, tokenized, max_seq_len=None, direction='left'):
+        max_seq_len = max_seq_len if max_seq_len else self.max_seq_len
+        
+        trunc_length = len(tokenized['word_ids']) - max_seq_len
+        if trunc_length <= 0:
+            return
+
+        if direction == 'right':
+            tokenized['word_ids'] = tokenized['word_ids'][:max_seq_len-1] + [self.word_map['<eos>']]
+            tokenized['w_l_tuple_ids'] = tokenized['w_l_tuple_ids'][:max_seq_len-1] + [self.w_l_tuple_map['<eos>']]
+            tokenized['task_ids'] = tokenized['task_ids'][:max_seq_len-1] + [self.task_map['<pad>']]
+            tokenized['labels'] = tokenized['labels'][:max_seq_len-1] + [self.label_pad_id]
+            tokenized['split_ids'] = tokenized['split_ids'][:max_seq_len-1] + [self.split_map['<pad>']]
+            tokenized['position_ids'] = tokenized['position_ids'][:max_seq_len]
+            tokenized['interaction_ids'] = tokenized['interaction_ids'][:max_seq_len-1] + [tokenized['interaction_ids'][-1]+1] 
+
+        elif direction == 'left':
+            tokenized['word_ids'] = [self.word_map['<bos>']] + tokenized['word_ids'][trunc_length+1:]
+            tokenized['w_l_tuple_ids'] = [self.w_l_tuple_map['<bos>']] + tokenized['w_l_tuple_ids'][trunc_length+1:]
+            tokenized['task_ids'] = [self.task_map['<pad>']] + tokenized['task_ids'][trunc_length+1:]
+            tokenized['labels'] = [self.label_pad_id] + tokenized['labels'][trunc_length+1:]
+            tokenized['split_ids'] = [self.split_map['<pad>']] + tokenized['split_ids'][trunc_length+1:]
+            tokenized['position_ids'] = [i for i in range(max_seq_len)]
+            
+            start_interaction = tokenized['interaction_ids'][trunc_length+1]
+            tokenized['interaction_ids'] = [-1] + [iid-start_interaction for iid in tokenized['interaction_ids'][trunc_length+1:]]
 
 
     def __len__(self):
         return len(self.data)
 
 
+    def construct_collate_fn(self, direction='left', max_seq_len=None):
+        
+        def collate_fn(batch_data):
+            batch_max_seq_len = max([len(data['word_ids']) for data in batch_data])
+
+            # logging.info('-- collate, {} examples, batch_max_seq_len {}'.format(len(batch_data), batch_max_seq_len))
+            if max_seq_len and max_seq_len < batch_max_seq_len:
+                batch_max_seq_len = max_seq_len
+
+            # align batch length
+            for data in batch_data:
+                # TODO: align/truncate attn_mask
+                self.truncate(data, max_seq_len=batch_max_seq_len, direction=direction)
+                self.pad(data, max_seq_len=batch_max_seq_len, direction=direction)
+            
+            x_user_ids = torch.tensor(np.stack([data['user_id'] for data in batch_data], axis=0))
+            x_user_abilities = torch.tensor(np.stack([data['user_ability'] for data in batch_data], axis=0))
+            x_word_ids = torch.tensor(np.stack([data['word_ids'] for data in batch_data], axis=0))
+            x_word_attn_masks = torch.tensor(np.stack([data['word_attn_mask'] for data in batch_data], axis=0))
+            x_w_l_tuple_ids = torch.tensor(np.stack([data['w_l_tuple_ids'] for data in batch_data], axis=0))
+            x_w_l_tuple_attn_masks = torch.tensor(np.stack([data['w_l_tuple_attn_mask'] for data in batch_data], axis=0))
+            x_position_ids = torch.tensor(np.stack([data['position_ids'] for data in batch_data], axis=0))
+            x_task_ids = torch.tensor(np.stack([data['task_ids'] for data in batch_data], axis=0))
+            x_interaction_ids = torch.tensor(np.stack([data['interaction_ids'] for data in batch_data], axis=0))
+            y_labels = torch.tensor(np.stack([data['labels'] for data in batch_data], axis=0))
+            split_ids = torch.tensor(np.stack([data['split_ids'] for data in batch_data], axis=0)) # 0 train, 1 dev, 2 test
+            x_valid_lengths = torch.tensor(np.stack([data['valid_length'] for data in batch_data], axis=0))
+            x_valid_interactions = torch.tensor(np.stack([data['valid_interactions'] for data in batch_data], axis=0))
+
+            return x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions
+
+
+        return collate_fn
 
 
 class DuolingoPersonalziedQGDataset(Dataset):
@@ -1048,17 +1028,17 @@ if __name__ == '__main__':
 
     # stats = get_statistics('/Users/cuipeng/Documents/Datasets/duolingo_2018_shared_task/data_en_es/en_es_format.jsonl', target_split=None)
     
-    build_dataset(
-        train_raw=args.duolingo_en_es_train_raw, 
-        dev_raw=args.duolingo_en_es_dev_raw, 
-        dev_key_raw=args.duolingo_en_es_dev_key_raw, 
-        test_raw=args.duolingo_en_es_test_raw, 
-        test_key_raw=args.duolingo_en_es_test_key_raw, 
-        format_output=args.duolingo_en_es_format, 
-        w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
-        word_file=args.duolingo_en_es_word_file, 
-        exercise_file=args.duolingo_en_es_exercise_file, 
-        non_adaptive_gen_file=args.duolingo_en_es_non_adaptive_exercise_gen,
-        build_kt=True,
-        build_gen_non_adaptive=False
-    )
+    # build_dataset(
+    #     train_raw=args.duolingo_en_es_train_raw, 
+    #     dev_raw=args.duolingo_en_es_dev_raw, 
+    #     dev_key_raw=args.duolingo_en_es_dev_key_raw, 
+    #     test_raw=args.duolingo_en_es_test_raw, 
+    #     test_key_raw=args.duolingo_en_es_test_key_raw, 
+    #     format_output=args.duolingo_en_es_format, 
+    #     w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
+    #     word_file=args.duolingo_en_es_word_file, 
+    #     exercise_file=args.duolingo_en_es_exercise_file, 
+    #     non_adaptive_gen_file=args.duolingo_en_es_non_adaptive_exercise_gen,
+    #     build_kt=True,
+    #     build_gen_non_adaptive=False
+    # )

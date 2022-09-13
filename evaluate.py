@@ -6,7 +6,7 @@ from nltk.translate.bleu_score import sentence_bleu
 import numpy as np
 from nltk import word_tokenize
 import torch.nn.functional as F
-from process_data import ascii_decode, ascii_encode
+from utils import *
 from tqdm import tqdm
 
 
@@ -143,16 +143,8 @@ class QGEvaluator:
 
 
 class KTEvaluator:
-    def __init__(self, num_words, user_ids=[], user_abilities=[], logits=[], labels=[], states=[], split_ids=[], valid_length=[], valid_interactions=[], label_pad_id=-100):
-        self.user_ids = user_ids
-        self.user_abilities = user_abilities
-        self.logits = logits
-        self.labels = labels
-        self.states = states
-        self.split_ids = split_ids
-        self.label_pad_id = label_pad_id
-        self.valid_length = valid_length
-        self.valid_interactions = valid_interactions 
+    def __init__(self, num_words, label_pad_id=-100):
+        self.data = []
         self.num_words = num_words
 
     def compute_metrics(self):
@@ -160,7 +152,7 @@ class KTEvaluator:
         # logits: [example_num, label_num(2)]
         # labels: [example_num, ]
         
-        total_examples = len(self.user_ids)
+        total_examples = len(self.data)
 
         results = {
             'train': {'roc':0, 'f1_score':0, 'accuracy':0, 'recall':0, 'precision':0}, 
@@ -173,20 +165,18 @@ class KTEvaluator:
             'dev': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
             'test': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
         }
-        pbar = tqdm(total=len(self.user_ids))
-        for example_id in range(total_examples):
+        pbar = tqdm(total=total_examples)
+        for data in self.data:
             for sid, split in ([(1, 'train'), (2, 'dev'), (3, 'test')]):
-                split_positions = np.where(self.split_ids[example_id] ==sid, True, False) # filter other splits
-                non_pad_positions = np.where(self.labels[example_id]>=0, True, False)   # filter pad labels
-                valid_positions = split_positions & non_pad_positions
+                valid_positions = np.where(data['split_ids']==sid, True, False) # filter other splits
                  
                 if not valid_positions.any():
                     logging.debug('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(self.user_ids[example_id]), split))
                     continue # no such split data
                 
 
-                valid_logits = self.logits[example_id][valid_positions] # flat
-                valid_labels = self.labels[example_id][valid_positions] # flat
+                valid_logits = data['logits'][valid_positions] # flat
+                valid_labels = data['labels'][valid_positions] # flat
                 
                 pred_labels = np.argmax(valid_logits, axis=-1)
                 positive_probs = F.softmax(torch.tensor(valid_logits), dim=-1)[:,1].numpy()            
@@ -197,7 +187,7 @@ class KTEvaluator:
             pbar.update(1)
         pbar.close()
         
-        logging.info('-- {} examples for evaluation; TRAIN: {} tokens; DEV: {} tokens; TEST: {} tokens.'.format(len(self.user_ids), len(collections['train']['labels']), len(collections['dev']['labels']), len(collections['test']['labels'])))        
+        logging.info('-- {} examples for evaluation; TRAIN: {} tokens; DEV: {} tokens; TEST: {} tokens.'.format(len(self.data), len(collections['train']['labels']), len(collections['dev']['labels']), len(collections['test']['labels'])))        
          
         for split in ['train', 'dev', 'test']:
             collections[split]['pred_labels'] = np.array(collections[split]['pred_labels'])
@@ -216,75 +206,106 @@ class KTEvaluator:
 
         return results
 
-    
 
-    def read(self, dir_name):
-        for file_name in os.listdir(dir_name):
-            with open(os.path.join(dir_name, file_name), 'r') as fp:
-                lines = fp.readlines()
-                for line in lines:
-                    data = json.loads(line.strip())
-                    self.user_ids.append(np.array(data['user_id']))
-                    self.user_abilities.append(np.array(data['user_ability']))
-                    self.logits.append(np.array(data['logits']))
-                    self.labels.append(np.array(data['labels']))
-                    self.states.append(np.array(data['states']))
-                    self.split_ids.append(np.array(data['split_ids']))
-        '''
-        self.user_ids = np.array(self.user_ids)
-        self.user_abilities = np.array(self.user_abilities)
-        self.logits = np.array(self.logits)
-        self.labels = np.array(self.labels)
-        self.states = np.array(self.states)
-        self.split_ids = np.array(self.split_ids)
-        '''
+    def add(self, user_id, user_ability, logits, labels, split_ids, interaction_ids, memory_states, valid_length, valid_interactions):
+        memory_points = []
+        cur_iid == -1
+        for idx in range(1, valid_length):
+            if interaction_ids[idx] != cur_iid:
+                memory_points.append(idx)
+                cur_iid = interaction_ids[idx]
 
-    def write(self, filename):
+        assert len(memory_points) == valid_interactions + 1
+
+        self.data.append({
+            'user_id': user_id,
+            'user_ability': user_ability,
+            'logits': logits[:valid_length],
+            'labels': labels[:valid_length],
+            'split_ids': split_ids[:valid_length],
+            'interaction_ids': interaction_ids[:valid_length],
+            'memory_states': memory_states[memory_points] # batch_size, interaction_num+1, num_words
+        })
+        
+
+
+    def save_result(self, dirname):
         fp = open(filename, 'w')
-        pbar = tqdm(total=len(self.user_ids))         
-        for idx in range(len(self.user_ids)):
-            
-            user_ability = self.user_abilities[idx].tolist()
-            user_id = self.user_ids[idx].tolist()
-            logits = self.logits[idx].tolist()[:self.valid_length[idx]]
-            labels = self.labels[idx].tolist()[:self.valid_length[idx]]
-            states = self.states[idx].tolist()[:self.valid_interactions[idx]]
-            states = torch.nn.functional.softmax(torch.tensor(states), dim=-1) # int_num, word_num, 2
-            states = states[:,:,1].numpy().tolist() # int_num, word_num, 1 
-            split_ids = self.split_ids[idx].tolist()[:self.valid_length[idx]]
-            ''' 
-            logging.info('interaction num raw is {}'.format(valid_int_positions.shape))
-            logging.info('logits shape {}'.format(self.logits[idx].shape))
-            logging.info('states shape {}'.format(self.states[idx].shape))
-            logging.info('logits to list {} {}'.format(self.logits[idx].tolist(), type(self.logits[idx].tolist()), len(self.logits[idx].tolist())))
-            logging.info('logits to list cut {} {}'.format(self.logits[idx].tolist()[:seq_len], type(self.logits[idx].tolist()[:seq_len]), len(self.logits[idx].tolist()[:seq_len])))
-            for i in range(len(states)):
-                logging.info('{}th state is {}'.format(i, states[i]))
-            logging.info('-- target logits {}'.format(logits))
-            logging.info('-- target labels {}'.format(labels))
-            logging.info('-- target splits {}'.format(split_ids))
-            logging.info('-- target states {}'.format(states))
-            logging.info('-- saving {}, seq_len {}, type {} interaction_num {}, type {}'.format(self.user_ids[idx], seq_len, type(seq_len), interaction_num, type(interaction_num))) 
-            logging.info('-- saving {}, logit len {}, labels len {}, states len {}, split_ids len {}'.format(self.user_ids[idx], len(logits), len(labels), len(states), len(split_ids))) 
-            new_states = self.states[idx][:self.valid_interactions[idx]]
-            logging.info('-- new states shape format{}'.format(new_states.shape))
-            new_logits = self.logits[idx][:self.valid_length[idx]]
-            logging.info('-- new logits shape format{}'.format(new_logits.shape))
-            exit(1)
-            seq_len = int(np.where(self.labels[idx]==-200, False, True).sum())
-            valid_int_positions = np.where((self.states[idx]==np.zeros([self.num_words, 2])).all(axis=1), False, True)
-            interaction_num = int(valid_int_positions.sum())
-            '''
-            dump = {
-                'user_id': user_id,
-                'user_ability': user_ability,
-                'logits': logits,
-                'labels': labels,
-                'states': states,
-                'split_ids': split_ids
-            }
-            fp.write(json.dumps(dump)+'\n')
+        pbar = tqdm(total=len(self.data))         
+        for data in self.data:
+            filename = '-'.join([str(num) for num in data['user_id']])
+            save_path = os.path.join(dirname, filename)
+            np.savez(save_path, **data)
             pbar.update(1)
         pbar.close()
         fp.close()
     
+
+
+def difficulty_calibration(word_file, generated_results, split=0.1, style='broken_line', fitting_degree=5):
+
+    style_config = {
+        'gpt-2': {'linestyle': '-', 'color': 'gray', 'marker': 'o'},
+        'bart-base': {'linestyle': '-.', 'color': 'red', 'marker': '<'},
+        't5-base': {'linestyle': ':', 'color': 'blue', 'marker': '*'}
+    }
+
+    for model_name in generated_results:
+        evaluator = QGEvaluator(word_file=word_file)
+        evaluator.read(generated_results[model_name])
+        print(len(evaluator.generated), len(evaluator.reference), len(evaluator.difficulty_scores), len(evaluator.generated_difficulty_scores))
+        evaluator.update_difficulty()
+
+        generated_scores = np.array(evaluator.generated_difficulty_scores)
+        reference_scores = np.array(evaluator.difficulty_scores)
+        
+        sorted_idx = np.argsort(generated_scores)
+
+        generated_scores = generated_scores[sorted_idx]
+        reference_scores = reference_scores[sorted_idx]
+
+
+        # print('here', model_name)
+        if style == 'fitting_line':
+            # plt.plot(generated_scores, reference_scores)
+            p= np.polyfit(generated_scores, reference_scores, fitting_degree)     ## fitting line
+            p = np.poly1d(p)
+            plt.plot(generated_scores, p(generated_scores), color='darkorange')
+            plt.plot((0, 3), (0, 3), color='green', linestyle='--')
+
+        elif style == 'broken_line':
+
+            bucket_data = [[] for i in range(30)]
+            for idx in range(len(generated_scores)):
+                bucket = int(generated_scores[idx] // split)
+                if bucket >= len(bucket_data):
+                    continue
+                bucket_data[bucket].append(idx)
+
+            trunc_pos = len(bucket_data)
+            for i in range(5, 30):
+                if len(bucket_data[i]) < 10:
+                    trunc_pos = i
+                    break 
+
+            bucket_data = bucket_data[:trunc_pos]
+            # print(len(bucket_data))
+
+            bucket_generated_score = [[generated_scores[idx] for idx in bucket] for bucket in bucket_data]
+            bucket_reference_score = [[reference_scores[idx] for idx in bucket] for bucket in bucket_data]
+
+            bucket_generated_score = [sum(scores)/len(scores) for scores in bucket_generated_score]
+            bucket_reference_score = [sum(scores)/len(scores) for scores in bucket_reference_score]
+            
+            # print(bucket_generated_score, )
+            # print(bucket_reference_score)
+            # print('='*100)
+            
+            plt.plot(bucket_generated_score, bucket_reference_score, label=model_name, **style_config[model_name])
+
+    plt.xlabel('Required difficulty')
+    plt.ylabel('Generated difficulty')
+    plt.plot((0, split*30), (0, split*30), color='green', linestyle='--')
+    plt.grid()
+    plt.legend()
+    plt.show()

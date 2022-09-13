@@ -89,7 +89,7 @@ class KnowledgeTracer(nn.Module):
         self.ff_output_memory_neg_2 = nn.Linear(2*num_words, num_words, bias=True)
 
 
-    def forward(self, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_sep_indices):
+    def forward(self, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_memory_update_matrix):
         '''
         x_word_ids:                 [batch_size, seq_len]
         x_w_l_tuple_ids:            [batch_size, seq_len]
@@ -102,6 +102,8 @@ class KnowledgeTracer(nn.Module):
         '''
 
         batch_size = x_word_ids.size(0)
+        seq_len = x_word_ids.size(1)
+
         pos_embs = self.positional_embeddings(x_word_ids)
         task_embs = self.task_embeddings(x_task_ids)
 
@@ -112,32 +114,46 @@ class KnowledgeTracer(nn.Module):
         w_l_tuple_embs = w_l_tuple_embs + task_embs + pos_embs
         word_embs = word_embs + task_embs + pos_embs
 
+        # intra-exercise context transformer
         h_word_state = word_embs
         for layer_id, word_encoding_layer in enumerate(self.word_encoder):
             h_word_state, cross_attn_weights = word_encoding_layer(query=h_word_state, key=h_word_state, value=h_word_state, attn_mask=x_word_attn_masks)
         
+        # causal interaction transformer
         h_w_l_tuple_state = w_l_tuple_embs
         for layer_id, w_l_tuple_encoding_layer in enumerate(self.w_l_tuple_encoder):
             h_w_l_tuple_state, cross_attn_weights = w_l_tuple_encoding_layer(query=h_w_l_tuple_state, key=h_w_l_tuple_state, value=h_w_l_tuple_state, attn_mask=x_w_l_tuple_attn_masks)
         
+        # cross causal <word, interaction> transformer
         h_cross_state = h_word_state
         for layer_id, cross_encoding_layer in enumerate(self.cross_encoder):
             h_cross_state, cross_attn_weights = cross_encoding_layer(query=h_cross_state, key=h_w_l_tuple_state, value=h_w_l_tuple_state, attn_mask=x_w_l_tuple_attn_masks)
 
         logits_context = self.ff_output_context_2(nn.functional.tanh(self.ff_output_context_1(h_cross_state))) # [batch_size, max_seq_len, 2]
 
-        memory_states = h_cross_state[torch.arange(0, batch_size).unsqueeze(-1), x_sep_indices] # [batch_size, num_interactions, hidden_size]
-        
-        memory_states_pos = self.ff_output_memory_pos_2(nn.functional.tanh(self.ff_output_memory_pos_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
-        memory_states_neg = self.ff_output_memory_neg_2(nn.functional.tanh(self.ff_output_memory_neg_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
+        memory_states_pos = self.ff_output_memory_pos_2(nn.functional.tanh(self.ff_output_memory_pos_1(h_cross_state))).unsqueeze(-1) # [batch_size, seq_len, num_words, 1]
+        memory_states_neg = self.ff_output_memory_neg_2(nn.functional.tanh(self.ff_output_memory_neg_1(h_cross_state))).unsqueeze(-1) # [batch_size, seq_len, num_words, 1]
         memory_states = torch.cat([memory_states_pos, memory_states_neg], dim=-1) # [batch_size, num_interactions, num_words, 2]
 
-        x_memory_update_triu = torch.triu(torch.ones(x_sep_indices.size(1), x_sep_indices.size(1)), diagonal=0).to(self.device) # [num_interactions, num_interactions]
-        memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_triu).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
-
-        batch_idx = torch.arange(0, batch_size).unsqueeze(-1) # unsqueeze for broadcast
-        logits_memory = memory_states[batch_idx, x_interaction_ids, x_word_ids] # [batch_size, max_seq_len, 2] 
+        # print('state', memory_states.shape, memory_states.dtype)
+        # print('update_matrix', x_memory_update_matrix.shape, x_memory_update_matrix.dtype)
+        memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_matrix).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
+        # print('state2', memory_states.shape, memory_states.dtype)
+        '''
+        # memory_states = h_cross_state[torch.arange(0, batch_size).unsqueeze(-1), x_sep_indices] # [batch_size, num_interactions, hidden_size]
+        # memory_states_pos = self.ff_output_memory_pos_2(nn.functional.tanh(self.ff_output_memory_pos_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
+        # memory_states_neg = self.ff_output_memory_neg_2(nn.functional.tanh(self.ff_output_memory_neg_1(memory_states))).unsqueeze(-1) # [batch_size, num_interactions, num_words, 1]
+        # memory_states = torch.cat([memory_states_pos, memory_states_neg], dim=-1) # [batch_size, num_interactions, num_words, 2]
+        # x_memory_update_triu = torch.triu(torch.ones(x_sep_indices.size(1), x_sep_indices.size(1)), diagonal=0).to(self.device) # [num_interactions, num_interactions]
+        # memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_triu).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
+        '''
         
+        logits_memory = memory_states[torch.arange(0, batch_size), torch.arange(0, seq_len), x_word_ids] # [batch_size, max_seq_len, 2] 
+
+        # print('lm', logits_memory.shape)
+        # print('lc', logits_context.shape)
+
+        # exit(1)
         logits = self.alpha * logits_memory + (1 - self.alpha) * logits_context # [batch_size, max_seq_len, 2]
 
         return logits, memory_states
