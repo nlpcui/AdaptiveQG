@@ -639,9 +639,9 @@ class DuolingoKTDataset(Dataset):
             else:
                 for source_idx in range(seq_len): # column
                     if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx]:
-                        w_l_tuple_attn_mask[target_idx][source_idx] = False
+                        w_l_tuple_attn_mask[target_idx][source_idx] = False # attend to previous interactions
                     elif data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx] == self.interaction_pad_id:
-                        w_l_tuple_attn_mask[target_idx][source_idx] == False
+                        w_l_tuple_attn_mask[target_idx][source_idx] == False # pad tokens attend to pad tokens
 
         return w_l_tuple_attn_mask
 
@@ -710,24 +710,49 @@ class DuolingoKTDataset(Dataset):
             return
 
         if direction == 'right':
-            tokenized['word_ids'] = tokenized['word_ids'][:max_seq_len-1] + [self.word_map['<eos>']]
-            tokenized['w_l_tuple_ids'] = tokenized['w_l_tuple_ids'][:max_seq_len-1] + [self.w_l_tuple_map['<eos>']]
-            tokenized['task_ids'] = tokenized['task_ids'][:max_seq_len-1] + [self.task_map['<pad>']]
-            tokenized['labels'] = tokenized['labels'][:max_seq_len-1] + [self.label_pad_id]
-            tokenized['split_ids'] = tokenized['split_ids'][:max_seq_len-1] + [self.split_map['<pad>']]
+            tokenized['word_ids'] = np.concatenate([tokenized['word_ids'][:max_seq_len-1], np.array([self.word_map['<eos>']])]) 
+            tokenized['w_l_tuple_ids'] = np.concatenate([tokenized['w_l_tuple_ids'][:max_seq_len-1], np.array([self.w_l_tuple_map['<eos>']])]) 
+            tokenized['task_ids'] = np.concatenate([tokenized['task_ids'][:max_seq_len-1], np.array([self.task_map['<pad>']])]) 
+            tokenized['labels'] = np.concatenate([tokenized['labels'][:max_seq_len-1], np.array([self.label_pad_id])])
+            tokenized['split_ids'] = np.concatenate([tokenized['split_ids'][:max_seq_len-1], np.array([self.split_map['<pad>']])])
+            tokenized['interaction_ids'] = np.concatenate([tokenized['interaction_ids'][:max_seq_len-1], np.array([tokenized['interaction_ids'][-1]+1])]) 
             tokenized['position_ids'] = tokenized['position_ids'][:max_seq_len]
-            tokenized['interaction_ids'] = tokenized['interaction_ids'][:max_seq_len-1] + [tokenized['interaction_ids'][-1]+1] 
+
+            # truncate attn mask
+            tokenized['word_attn_mask'] = tokenized['word_attn_mask'][:seq_len,:seq_len]
+            tokenized['word_attn_mask'][-1, :] = True
+            tokenized['word_attn_mask'][:, -1] = True
+            tokenized['word_attn_mask'][-1, -1] = False
+
+            tokenized['w_l_tuple_attn_mask'] = tokenized['w_l_tuple_attn_mask'][:seq_len,:seq_len]
+            tokenized['w_l_tuple_attn_mask'][:, -1] = True
+            tokenized['w_l_tuple_attn_mask'][-1, :] = False
+            ## end mask truncation
 
         elif direction == 'left':
-            tokenized['word_ids'] = [self.word_map['<bos>']] + tokenized['word_ids'][trunc_length+1:]
-            tokenized['w_l_tuple_ids'] = [self.w_l_tuple_map['<bos>']] + tokenized['w_l_tuple_ids'][trunc_length+1:]
-            tokenized['task_ids'] = [self.task_map['<pad>']] + tokenized['task_ids'][trunc_length+1:]
-            tokenized['labels'] = [self.label_pad_id] + tokenized['labels'][trunc_length+1:]
-            tokenized['split_ids'] = [self.split_map['<pad>']] + tokenized['split_ids'][trunc_length+1:]
+            tokenized['word_ids'] = np.concatenate([np.array([self.word_map['<bos>']]), tokenized['word_ids'][trunc_length+1:]])
+            tokenized['w_l_tuple_ids'] = np.concatenate([np.array([self.w_l_tuple_map['<bos>']]), tokenized['w_l_tuple_ids'][trunc_length+1:]])
+            tokenized['task_ids'] = np.concatenate([np.array([self.task_map['<pad>']]), tokenized['task_ids'][trunc_length+1:]])
+            tokenized['labels'] = np.concatenate([np.array([self.label_pad_id]), tokenized['labels'][trunc_length+1:]]) 
+            tokenized['split_ids'] = np.concatenate([np.array([self.split_map['<pad>']]), tokenized['split_ids'][trunc_length+1:]])
             tokenized['position_ids'] = [i for i in range(max_seq_len)]
             
             start_interaction = tokenized['interaction_ids'][trunc_length+1]
-            tokenized['interaction_ids'] = [-1] + [iid-start_interaction for iid in tokenized['interaction_ids'][trunc_length+1:]]
+            tokenized['interaction_ids'] = np.concatenate([np.array([-1]), tokenized['interaction_ids'][trunc_length+1:]-start_interaction])
+
+            # truncate attn mask
+            tokenized['word_attn_mask'] = tokenized['word_attn_mask'][trunc_length:,trunc_length:]
+            tokenized['word_attn_mask'][:, 0] = True
+            tokenized['word_attn_mask'][0, :] = True
+            tokenized['word_attn_mask'][0, 0] = False
+
+            tokenized['w_l_tuple_attn_mask'] = tokenized['w_l_tuple_attn_mask'][trunc_length:, trunc_length:]
+            tokenized['w_l_tuple_attn_mask'][:, 0] = True
+            tokenized['w_l_tuple_attn_mask'][0, :] = True
+            tokenized['w_l_tuple_attn_mask'][0, 0] = False 
+            # end mask truncation
+
+
 
 
     def __len__(self):
