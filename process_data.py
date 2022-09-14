@@ -595,30 +595,20 @@ class DuolingoKTDataset(Dataset):
         instance['labels'].append(self.label_pad_id)
 
         instance['position_ids'] = [i for i in range(len(instance['word_ids']))]
-
-        if truncation and len(instance['word_ids']) > self.max_seq_len:
-            self.truncate(instance)
-
-        if padding and len(tokenized['word_ids']) < self.max_seq_len:
-            self.pad(tokenized)
         
         instance['word_attn_mask'] = self.__build_word_attn_mask(instance)
         instance['w_l_tuple_attn_mask'] = self.__build_w_l_tuple_attn_mask(instance)
         instance['valid_length'] = [len(instance['word_ids'])]
         instance['valid_interactions'] = [instance['interaction_ids'][-1]]
 
-        # words = words[-self.max_seq_len+2:]
-        # print(words)
-        # for key in instance:
-        #     print(key)
-        #     if key == 'word_attn_mask' or key == 'w_l_tuple_attn_mask':
-        #         for row in instance[key]:
-        #             print(row)
-        #     else:
-        #         print(instance[key])
-
         for key in instance:
             instance[key] = np.array(instance[key])
+
+        if truncation and len(instance['word_ids']) > self.max_seq_len:
+            self.truncate(instance)
+
+        if padding and len(tokenized['word_ids']) < self.max_seq_len:
+            self.pad(tokenized)
 
         return instance
 
@@ -692,20 +682,23 @@ class DuolingoKTDataset(Dataset):
         pad_interaction_ids = [self.interaction_pad_id for i in range(seq_pad_length)] # TODO: 是否-100 做填充？
 
         if direction == 'right':
-            tokenized['word_ids'] += pad_word_ids
-            tokenized['w_l_tuple_ids'] += pad_w_l_tuple_ids
-            tokenized['task_ids'] += pad_task_ids
-            tokenized['labels'] += pad_labels
-            tokenized['split_ids'] += pad_split_ids
-            tokenized['interaction_ids'] += pad_interaction_ids
+            pad_width = (0, seq_pad_length)
+            attn_pad_width = ((0, seq_pad_length), (0, seq_pad_length))
         elif direction == 'left':
-            tokenized['word_ids'] = pad_word_ids + tokenized['word_ids']
-            tokenized['w_l_tuple_ids'] = pad_w_l_tuple_ids + tokenized['w_l_tuple_ids']
-            tokenized['task_ids'] = pad_task_ids + tokenized['task_ids']
-            tokenized['labels'] = pad_labels + tokenized['labels']
-            tokenized['split_ids'] = pad_split_ids + tokenized['split_ids']
-            tokenized['interaction_ids'] = pad_interaction_ids + tokenized['interaction_ids']
+            pad_width = (seq_pad_length, 0)
+            attn_pad_width = ((seq_pad_length, 0), (seq_pad_length, 0))
+        
+        tokenized['word_ids'] = np.pad(tokenized['word_ids'], pad_width, constant_values=(self.word_map['<pad>'], self.word_map['<pad>']))
+        tokenized['w_l_tuple_ids'] = np.pad(tokenized['w_l_tuple_ids'], pad_width, constant_values=(self.w_l_tuple_map['<pad>'], self.w_l_tuple_map['<pad>']))
+        tokenized['task_ids'] = np.pad(tokenized['task_ids'], pad_width, constant_values=(self.task_map['<pad>'], self.task_map['<pad>']))
+        tokenized['labels'] = np.pad(tokenized['labels'], pad_width, constant_values=(self.label_pad_id, self.label_pad_id))
+        tokenized['split_ids'] = np.pad(tokenized['split_ids'], pad_width, constant_values=(self.split_map['<pad>'], self.split_map['<pad>']))
+        tokenized['interaction_ids'] = np.pad(tokenized['split_ids'], pad_width, constant_values=(self.interaction_pad_id, self.interaction_pad_id))
 
+        #TODO: pad mask
+        tokenized['word_attn_mask'] = np.pad(tokenized['word_attn_mask'], attn_pad_width, constant_values=((False, False), (True, True)))
+        tokenized['w_l_tuple_attn_mask'] = np.pad(tokenized['w_l_tuple_attn_mask'], attn_pad_width, constant_values=((False, False), (True, True)))
+    
         tokenized['position_ids'] = [i for i in range(len(tokenized['position_ids']))]
         
 
