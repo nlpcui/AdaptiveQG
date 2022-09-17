@@ -169,9 +169,8 @@ class KTEvaluator:
         for data in self.data:
             for sid, split in ([(1, 'train'), (2, 'dev'), (3, 'test')]):
                 valid_positions = np.where(data['split_ids']==sid, True, False) # filter other splits
-                 
                 if not valid_positions.any():
-                    logging.debug('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(self.user_ids[example_id]), split))
+                    logging.info('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(data['user_id']), split))
                     continue # no such split data
                 
 
@@ -207,30 +206,31 @@ class KTEvaluator:
         return results
 
 
-    def add(self, user_id, user_ability, logits, labels, split_ids, interaction_ids, memory_states, valid_length, valid_interactions):
+    def add(self, user_id, user_ability, logits, labels, split_ids, interaction_ids, memory_states, valid_length, valid_interactions, direction):
         memory_points = []
-        cur_iid == -1
-        for idx in range(1, valid_length):
-            if interaction_ids[idx] != cur_iid:
+        cur_iid = -1
+        for idx in range(len(interaction_ids)):
+            if interaction_ids[idx] == cur_iid:
                 memory_points.append(idx)
-                cur_iid = interaction_ids[idx]
+                cur_iid += 1
 
-        assert len(memory_points) == valid_interactions + 1
+        assert len(memory_points) == valid_interactions[0] + 1
+
 
         self.data.append({
             'user_id': user_id,
             'user_ability': user_ability,
-            'logits': logits[:valid_length],
-            'labels': labels[:valid_length],
-            'split_ids': split_ids[:valid_length],
-            'interaction_ids': interaction_ids[:valid_length],
-            'memory_states': memory_states[memory_points] # batch_size, interaction_num+1, num_words
+            'logits': logits[:valid_length[0]] if direction=='right' else logits[-valid_length[0]:],
+            'labels': labels[:valid_length[0]] if direction=='right' else labels[-valid_length[0]:],
+            'split_ids': split_ids[:valid_length[0]] if direction=='right' else split_ids[-valid_length[0]:],
+            'interaction_ids': interaction_ids[:valid_length[0]] if direction=='right' else interaction_ids[-valid_length[0]:],
+            'memory_states': memory_states[memory_points], # [interaction_num+1, num_words]
+            'mastery_level': np.mean(memory_states, axis=-1) # [interaction_num+1, ]
         })
         
 
 
     def save_result(self, dirname):
-        fp = open(filename, 'w')
         pbar = tqdm(total=len(self.data))         
         for data in self.data:
             filename = '-'.join([str(num) for num in data['user_id']])
@@ -238,8 +238,37 @@ class KTEvaluator:
             np.savez(save_path, **data)
             pbar.update(1)
         pbar.close()
-        fp.close()
     
+
+
+    def load(self, dirname):
+        for filename in os.listdir(dirname):
+            self.data.append(np.load(os.path.join(dirname, filename)))
+
+
+    def learning_curve(self, user_selection, min_ratio=0.1, max_steps=1000):
+        knowledge_growth = {}
+
+        ## select target users (by abilities)
+        user_abilities = [(ascii_decode(data['user_id']), data['user_ability']) for data in self.data]
+        user_abilities.sort(key=lambda x:x[1])
+        target_users = user_abilities[int(user_selection[0]*len(self.data)): int(user_selection[1]*len(self.data))]
+
+        result = {}
+
+        for step in range(max_steps):
+            cur_step_ability = [] # students' abilities in this step
+            for data in self.data:
+                if ascii_decode(data['user_id']) not in target_users:
+                    continue
+                
+                cur_step_ability.append(data['mastery_level'][step])
+            
+            if len(cur_step_ability) < len(self.data)*min_ratio:
+                pass
+
+
+
 
 
 def difficulty_calibration(word_file, generated_results, split=0.1, style='broken_line', fitting_degree=5):

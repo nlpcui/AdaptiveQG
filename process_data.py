@@ -164,7 +164,7 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
     df = pd.DataFrame(exercise_map.values(), columns=['exercise', 'cnt', 'exercise_error_cnt', 'word_error_cnt', 'exercise_error_rate', 'avg_word_error_cnt', 'sum_word_error_rate'])
     df.to_csv(exercise_file, index=False)
 
-    ## compute user_ability -- correct_rate*ave_difficulty
+    ## compute user_ability: correct_rate * ave_difficulty
     for user in user_interactions:
         error_cnt = 0
         difficulty_score = 0
@@ -181,7 +181,7 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
         difficulty_score /= total_cnt
         correct_rate = 1 - (error_cnt / total_cnt)
 
-        user_interactions[user]['user_ability'] = (difficulty_score + correct_rate) / 2 # ave_word_difficulty * ave_word_correct_rate
+        user_interactions[user]['user_ability'] = (difficulty_score * correct_rate) / 2 # ave_word_difficulty * ave_word_correct_rate
 
     ## format data for knowledge tracing
     '''
@@ -599,10 +599,16 @@ class DuolingoKTDataset(Dataset):
         instance['word_attn_mask'] = self.__build_word_attn_mask(instance)
         instance['w_l_tuple_attn_mask'] = self.__build_w_l_tuple_attn_mask(instance)
         instance['valid_length'] = [len(instance['word_ids'])]
-        instance['valid_interactions'] = [instance['interaction_ids'][-1]]
+        instance['valid_interactions'] = [instance['interaction_ids'][-1]+1] 
 
         for key in instance:
             instance[key] = np.array(instance[key])
+
+        # valid = self.check(instance['w_l_tuple_attn_mask'])
+        # if valid:
+        #     print('valid', valid)
+        #     print('valid_length', instance['valid_length'])
+        #     exit(1)
 
         if truncation and len(instance['word_ids']) > self.max_seq_len:
             self.truncate(instance)
@@ -611,6 +617,13 @@ class DuolingoKTDataset(Dataset):
             self.pad(tokenized)
 
         return instance
+
+
+    def check(self, mask):
+        for idx, row in enumerate(mask):
+            if not (row == False).any():
+                return idx, row.shape
+        return None
 
 
     def __build_word_attn_mask(self, data):
@@ -673,7 +686,8 @@ class DuolingoKTDataset(Dataset):
 
         if seq_pad_length <= 0:
             return 
-        
+
+
         pad_word_ids = [self.word_map['<pad>'] for i in range(seq_pad_length)]
         pad_w_l_tuple_ids = [self.w_l_tuple_map['<pad>'] for i in range(seq_pad_length)]
         pad_task_ids = [self.task_map['<pad>'] for i in range(seq_pad_length)]
@@ -693,13 +707,12 @@ class DuolingoKTDataset(Dataset):
         tokenized['task_ids'] = np.pad(tokenized['task_ids'], pad_width, constant_values=(self.task_map['<pad>'], self.task_map['<pad>']))
         tokenized['labels'] = np.pad(tokenized['labels'], pad_width, constant_values=(self.label_pad_id, self.label_pad_id))
         tokenized['split_ids'] = np.pad(tokenized['split_ids'], pad_width, constant_values=(self.split_map['<pad>'], self.split_map['<pad>']))
-        tokenized['interaction_ids'] = np.pad(tokenized['split_ids'], pad_width, constant_values=(self.interaction_pad_id, self.interaction_pad_id))
+        tokenized['interaction_ids'] = np.pad(tokenized['interaction_ids'], pad_width, constant_values=(self.interaction_pad_id, self.interaction_pad_id))
+    
+        tokenized['position_ids'] = np.array([i for i in range(max_seq_len)])
 
-        #TODO: pad mask
         tokenized['word_attn_mask'] = np.pad(tokenized['word_attn_mask'], attn_pad_width, constant_values=((False, False), (True, True)))
         tokenized['w_l_tuple_attn_mask'] = np.pad(tokenized['w_l_tuple_attn_mask'], attn_pad_width, constant_values=((False, False), (True, True)))
-    
-        tokenized['position_ids'] = [i for i in range(len(tokenized['position_ids']))]
         
 
     def truncate(self, tokenized, max_seq_len=None, direction='left'):
@@ -709,13 +722,16 @@ class DuolingoKTDataset(Dataset):
         if trunc_length <= 0:
             return
 
+        tokenized['valid_length'] = np.array([max_seq_len])
+
         if direction == 'right':
             tokenized['word_ids'] = np.concatenate([tokenized['word_ids'][:max_seq_len-1], np.array([self.word_map['<eos>']])]) 
             tokenized['w_l_tuple_ids'] = np.concatenate([tokenized['w_l_tuple_ids'][:max_seq_len-1], np.array([self.w_l_tuple_map['<eos>']])]) 
             tokenized['task_ids'] = np.concatenate([tokenized['task_ids'][:max_seq_len-1], np.array([self.task_map['<pad>']])]) 
             tokenized['labels'] = np.concatenate([tokenized['labels'][:max_seq_len-1], np.array([self.label_pad_id])])
             tokenized['split_ids'] = np.concatenate([tokenized['split_ids'][:max_seq_len-1], np.array([self.split_map['<pad>']])])
-            tokenized['interaction_ids'] = np.concatenate([tokenized['interaction_ids'][:max_seq_len-1], np.array([tokenized['interaction_ids'][-1]+1])]) 
+            tokenized['interaction_ids'] = np.concatenate([tokenized['interaction_ids'][:max_seq_len-1], np.array([tokenized['interaction_ids'][-1]+1])])
+            tokenized['valid_interactions'][0] = tokenized['interaction_ids'][-1] + 1
             tokenized['position_ids'] = tokenized['position_ids'][:max_seq_len]
 
             # truncate attn mask
@@ -735,10 +751,11 @@ class DuolingoKTDataset(Dataset):
             tokenized['task_ids'] = np.concatenate([np.array([self.task_map['<pad>']]), tokenized['task_ids'][trunc_length+1:]])
             tokenized['labels'] = np.concatenate([np.array([self.label_pad_id]), tokenized['labels'][trunc_length+1:]]) 
             tokenized['split_ids'] = np.concatenate([np.array([self.split_map['<pad>']]), tokenized['split_ids'][trunc_length+1:]])
-            tokenized['position_ids'] = [i for i in range(max_seq_len)]
+            tokenized['position_ids'] = np.array([i for i in range(max_seq_len)])
             
             start_interaction = tokenized['interaction_ids'][trunc_length+1]
             tokenized['interaction_ids'] = np.concatenate([np.array([-1]), tokenized['interaction_ids'][trunc_length+1:]-start_interaction])
+            tokenized['valid_interactions'][0] = tokenized['interaction_ids'][-1] + 1
 
             # truncate attn mask
             tokenized['word_attn_mask'] = tokenized['word_attn_mask'][trunc_length:,trunc_length:]
@@ -747,12 +764,12 @@ class DuolingoKTDataset(Dataset):
             tokenized['word_attn_mask'][0, 0] = False
 
             tokenized['w_l_tuple_attn_mask'] = tokenized['w_l_tuple_attn_mask'][trunc_length:, trunc_length:]
-            tokenized['w_l_tuple_attn_mask'][:, 0] = True
             tokenized['w_l_tuple_attn_mask'][0, :] = True
-            tokenized['w_l_tuple_attn_mask'][0, 0] = False 
+            tokenized['w_l_tuple_attn_mask'][:, 0] = False
             # end mask truncation
 
-
+        
+        # print('after', tokenized['interaction_ids'].shape)
 
 
     def __len__(self):
@@ -767,13 +784,17 @@ class DuolingoKTDataset(Dataset):
             # logging.info('-- collate, {} examples, batch_max_seq_len {}'.format(len(batch_data), batch_max_seq_len))
             if max_seq_len and max_seq_len < batch_max_seq_len:
                 batch_max_seq_len = max_seq_len
-
+            
             # align batch length
             for data in batch_data:
                 # TODO: align/truncate attn_mask
+                # print('before', data['interaction_ids'].shape)
                 self.truncate(data, max_seq_len=batch_max_seq_len, direction=direction)
+                # print('after truncate', data['interaction_ids'].shape)
                 self.pad(data, max_seq_len=batch_max_seq_len, direction=direction)
-            
+            #     print('after truncate and pad', data['interaction_ids'].shape)
+            # exit(1)
+
             x_user_ids = torch.tensor(np.stack([data['user_id'] for data in batch_data], axis=0))
             x_user_abilities = torch.tensor(np.stack([data['user_ability'] for data in batch_data], axis=0))
             x_word_ids = torch.tensor(np.stack([data['word_ids'] for data in batch_data], axis=0))

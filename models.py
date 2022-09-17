@@ -6,6 +6,50 @@ from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2Se
 import numpy as np
 
 
+
+class CrossEntropyFocalLoss(torch.nn.Module):
+    def __init__(self, gamma=0, alpha=None, reduction='mean', ignore_index=-100):
+        super(CrossEntropyFocalLoss, self).__init__()
+        self.reduction = reduction 
+        self.lb_ignore = ignore_index
+        self.gamma = gamma # focal factor
+        self.alpha = alpha # class weight, tensor
+        self.log_softmax = torch.nn.LogSoftmax(dim=1)
+
+    def forward(self, logits, label):
+        # overcome ignored label
+        logits = logits.float() # use fp32 to avoid nan
+        with torch.no_grad():
+            num_classes = logits.size(1)
+            label = label.clone().detach()
+            ignore = label.eq(self.lb_ignore)
+            n_valid = ignore.eq(0).sum()
+            label[ignore] = 0
+
+            lb_pos, lb_neg = 1. , 0.
+            lb_one_hot = torch.empty_like(logits).fill_(lb_neg).scatter_(1, label.unsqueeze(1), lb_pos).detach()
+
+        logs = self.log_softmax(logits)
+
+        if self.alpha is not None:
+            alpha = self.alpha.gather(0, label.detach().view(-1))
+            n_valid = alpha.sum()
+            logs = logs * alpha
+
+        pt = logs.detach().exp()
+        focal_factor = (1-pt) ** self.gamma
+
+        loss = -torch.sum(focal_factor * logs * lb_one_hot, dim=1)
+
+        loss[ignore] = 0 # ignore_index no loss
+        if self.reduction == 'mean':
+            loss = loss.sum() / n_valid
+        if self.reduction == 'sum':
+            loss = loss.sum()
+
+        return loss
+    
+
 class PostionalEncoding(nn.Module):
     def __init__(self, d_model, device='cpu', max_seq_len=5000):
         """
@@ -119,25 +163,54 @@ class KnowledgeTracer(nn.Module):
         for layer_id, word_encoding_layer in enumerate(self.word_encoder):
             h_word_state, cross_attn_weights = word_encoding_layer(query=h_word_state, key=h_word_state, value=h_word_state, attn_mask=x_word_attn_masks)
         
+        # print('h_word_state has nan? {}'.format(torch.isnan(h_word_state).any()))
         # causal interaction transformer
         h_w_l_tuple_state = w_l_tuple_embs
         for layer_id, w_l_tuple_encoding_layer in enumerate(self.w_l_tuple_encoder):
             h_w_l_tuple_state, cross_attn_weights = w_l_tuple_encoding_layer(query=h_w_l_tuple_state, key=h_w_l_tuple_state, value=h_w_l_tuple_state, attn_mask=x_w_l_tuple_attn_masks)
-        
+        # print('h_tuple_state has nan? {}'.format(torch.isnan(h_w_l_tuple_state).any()))
         # cross causal <word, interaction> transformer
         h_cross_state = h_word_state
         for layer_id, cross_encoding_layer in enumerate(self.cross_encoder):
             h_cross_state, cross_attn_weights = cross_encoding_layer(query=h_cross_state, key=h_w_l_tuple_state, value=h_w_l_tuple_state, attn_mask=x_w_l_tuple_attn_masks)
+        # print('h_cross_state has nan? {}'.format(torch.isnan(h_cross_state).any()))
 
-        logits_context = self.ff_output_context_2(nn.functional.tanh(self.ff_output_context_1(h_cross_state))) # [batch_size, max_seq_len, 2]
+        logits_context = self.ff_output_context_2(torch.tanh(self.ff_output_context_1(h_cross_state))) # [batch_size, max_seq_len, 2]
+        # print('logits_context has nan? {}'.format(torch.isnan(logits_context).any()))
+        memory_states_pos = self.ff_output_memory_pos_2(torch.tanh(self.ff_output_memory_pos_1(h_cross_state))) # .unsqueeze(-1) # [batch_size, seq_len, num_words]
+        memory_states_pos_acc = torch.matmul(memory_states_pos.permute(0, 2, 1), x_memory_update_matrix).permute(0, 2, 1)
 
-        memory_states_pos = self.ff_output_memory_pos_2(nn.functional.tanh(self.ff_output_memory_pos_1(h_cross_state))).unsqueeze(-1) # [batch_size, seq_len, num_words, 1]
-        memory_states_neg = self.ff_output_memory_neg_2(nn.functional.tanh(self.ff_output_memory_neg_1(h_cross_state))).unsqueeze(-1) # [batch_size, seq_len, num_words, 1]
-        memory_states = torch.cat([memory_states_pos, memory_states_neg], dim=-1) # [batch_size, num_interactions, num_words, 2]
+        memory_states_neg = self.ff_output_memory_neg_2(torch.tanh(self.ff_output_memory_neg_1(h_cross_state))) #.unsqueeze(-1) # [batch_size, seq_len, num_words]
+        memory_states_neg_acc = torch.matmul(memory_states_neg.permute(0, 2, 1), x_memory_update_matrix).permute(0, 2, 1) # [batch_size, seq_len, num_words]
 
-        # print('state', memory_states.shape, memory_states.dtype)
-        # print('update_matrix', x_memory_update_matrix.shape, x_memory_update_matrix.dtype)
-        memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_matrix).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
+        memory_states_acc = torch.stack([memory_states_pos_acc, memory_states_neg_acc], dim=-1)
+
+        index = x_word_ids.unsqueeze(-1)
+        word_mastery_pos_acc = torch.gather(memory_states_pos_acc, dim=-1, index=index) # [batch_size, seq_len, 1]
+        word_mastery_neg_acc = torch.gather(memory_states_neg_acc, dim=-1, index=index) # [batch_size, seq_len, 1]
+
+        # print('gather shape', word_mastery_pos_acc.shape, word_mastery_neg_acc.shape)
+
+        logits_memory = torch.cat([word_mastery_pos_acc, word_mastery_neg_acc], dim=-1) # [batch_size, seq_len, 2]
+        
+        # print('logits_memory.shape', logits_memory.shape)
+        # print('memory_states_acc.shape', memory_states_acc.shape)
+        # exit(1)
+        # batch_indices = torch.arange(0, batch_size).unsqueeze(1)
+        # step_indices = torch.arange(0, seq_len).unsqueeze(0)
+        # word_indices = x_word_ids
+
+        # logits_memory = memory_states[batch_indices, step_indices, x_word_ids] #  [batch_size, max_seq_len, 2] 
+
+        # memory_states = torch.cat([memory_states_pos, memory_states_neg], dim=-1) # [batch_size, num_interactions, num_words, 2]
+        # print('memory states has nan? {}'.format(torch.isnan(memory_states).any()))
+        # print('state', memory_states.permute(0, 3, 2, 1).shape, memory_states.dtype)
+        # print('update_matrix', x_memory_update_matrix.unsqueeze(1).shape, x_memory_update_matrix.dtype)
+
+        # [batch_size, 2, num_words, seq_len] * [8, 1, seq_len, seq_len]
+        # memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_matrix.unsqueeze(1)).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
+        # print('2memory states has nan? {}'.format(torch.isnan(memory_states).any()))
+        # exit(1)
         # print('state2', memory_states.shape, memory_states.dtype)
         '''
         # memory_states = h_cross_state[torch.arange(0, batch_size).unsqueeze(-1), x_sep_indices] # [batch_size, num_interactions, hidden_size]
@@ -148,15 +221,19 @@ class KnowledgeTracer(nn.Module):
         # memory_states = torch.matmul(memory_states.permute(0, 3, 2, 1), x_memory_update_triu).permute(0, 3, 2, 1) # [batch_size, num_interactions, num_words, 2]
         '''
         
-        logits_memory = memory_states[torch.arange(0, batch_size), torch.arange(0, seq_len), x_word_ids] # [batch_size, max_seq_len, 2] 
+        # torch.arange(0, batch_size).unsqueeze(1), torch.arange(0, seq_len).unsqueeze(1), 
+        '''
+        states: [batch_size, seq_len, word_num, 2]
+        indices: [batch_size, seq_len]
+        output: [batch_size, seq_len, 2]
+        '''
 
-        # print('lm', logits_memory.shape)
-        # print('lc', logits_context.shape)
-
-        # exit(1)
+        # print('logits_memory has nan? {}'.format(torch.isnan(logits_memory).any()))
         logits = self.alpha * logits_memory + (1 - self.alpha) * logits_context # [batch_size, max_seq_len, 2]
 
-        return logits, memory_states
+        # print('logits has nan? {}'.format(torch.isnan(logits).any()))
+        # exit(1)
+        return logits, memory_states_acc
 
 
 

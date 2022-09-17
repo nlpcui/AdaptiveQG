@@ -39,7 +39,19 @@ def ascii_decode(x):
     return ''.join(result)
 
 
+
+def format_distribution(distr, total):
+    distr = collections.OrderedDict(sorted(distr.items(), key=lambda x:x[0]))
+    acc = 0
+    for key in distr:
+        distr[key] = (distr[key], acc + (distr[key] / total), (distr[key] / total)) # bucket, cnt, acc_portion 
+        acc = distr[key][1]
+    
+    return distr
+
+
 def calc_word_error_rate(data_file, output_file, selection=[0, 1]):
+    ## get word difficulty (non-adaptive)
     abilities = []
 
     word_error_rate = {}
@@ -73,17 +85,11 @@ def calc_word_error_rate(data_file, output_file, selection=[0, 1]):
     df.to_csv(output_file)
 
 
-def format_distribution(distr, total):
-    distr = collections.OrderedDict(sorted(distr.items(), key=lambda x:x[0]))
-    acc = 0
-    for key in distr:
-        distr[key] = (distr[key], acc + (distr[key] / total), (distr[key] / total)) # bucket, cnt, acc_portion 
-        acc = distr[key][1]
-    
-    return distr
-
 
 def calc_student_ability_distribution(data_file, split=1000):
+    '''
+    distribution of students' abilities (defined as correct_rate*ave_difficulty)
+    '''
     ability_dist = {}
     total = 0
     with open(data_file, 'r') as fp:
@@ -98,7 +104,6 @@ def calc_student_ability_distribution(data_file, split=1000):
 
     ability_dist = format_distribution(ability_dist, total)
     pprint(ability_dist)
-    # exit(1)
     target_keys = [i for i in range(41, 57)]
     values = []
 
@@ -118,7 +123,9 @@ def calc_student_ability_distribution(data_file, split=1000):
 
 
 def calc_difficulty_trend(data_file, word_map_file, start_step=100, max_step=600, min_rate=0.1, fitting_line=True, average=True):
-
+    '''
+    the difficulty changing trend of exercises.
+    '''
     word_error_rate = {}
     df = pd.read_csv(word_map_file)
     for idx, row in df.iterrows():
@@ -183,71 +190,11 @@ def calc_difficulty_trend(data_file, word_map_file, start_step=100, max_step=600
         plt.plot(step_ids, p_absolute(step_ids), color='green', linestyle='--')
     plt.show()
 
-    ## plot relative
-    # plt.plot(step_ids, step_relative_difficulties)
-    # plt.show()
-
-    # plt.figure()
-    # data_absolute = pd.DataFrame(np.column_stack((step_ids, step_absolute_difficulties)), columns=['Practices', 'Difficulty'])
-    # data_relative = pd.DataFrame(np.column_stack((step_ids, step_relative_difficulties)), columns=['Practices', 'Errors'])
-    
-    # sns.relplot(x='Practices', y='Difficulty', data=data_absolute, kind='line')
-    # p_absolute = np.polyfit(step_ids, step_absolute_difficulties, 2)     ## fitting line
-    # p_absolute = np.poly1d(p_absolute)
-    # plt.plot(step_ids, p_absolute(step_ids), color='g')
-    # plt.show()
-    
-    # sns.relplot(x='Practices', y='Errors', data=data_relative, kind='line')
-    # p_relative = np.polyfit(step_ids, step_relative_difficulties, 2)
-    # p_relative = np.poly1d(p_relative)
-    # plt.plot(step_ids, p_relative(step_ids), color='g')
-    # plt.show()
 
 
 
-def draw_picture():
-    time = np.arange(0, 2*np.pi, 0.1)
-    sin_waves = np.sin(time)
-    sin_waves = np.expand_dims(sin_waves, axis=-1)
-    
-    noise = np.random.random((time.size, 10)) - 0.5
-    data = sin_waves + noise
-    data_mean = np.mean(data, axis=1)
 
-    data_std = np.std(data, axis=1)
-    data_var = np.var(data, axis=1)
-    data_max = np.max(data, axis=1)
-    data_min = np.min(data, axis=1)
-
-    time_array = time
-    for i in range(noise.shape[1] - 1):
-        time_array = np.column_stack((time_array, time))
-
-    print(time_array)
-    print(time_array.shape)
-    # 将 time 和 signal 平铺为两列数据，且一一对应
-    time_array = time_array.flatten()  # (630,)
-    print(time_array)
-    data = data.flatten()  # (630,)
-    data = np.column_stack((time_array, data))  # (630,2)
-    df = pd.DataFrame(data, columns=['time', 'signal'])
-    
-    plt.figure()
-    plt.plot(data_mean)
-    plt.show()
-    plt.figure()
-    plt.plot(data_std)
-    plt.show()
-    
-    # 绘图
-    sns.relplot(x='time', y='signal', data=df)
-    plt.show()
-    sns.relplot(x='time', y='signal', data=df, kind='line')
-    plt.show()
-
-
-
-def calc_ability_trend(data_file, word_map_file, max_steps, group_size=50, min_rate=0.1, selection=None):
+def calc_ability_trend(result_dir, word_map_file, max_steps, group_size=50, min_rate=0.1, selection=None):
 
     word_difficulty_map = {}
     df = pd.read_csv(word_map_file)
@@ -257,6 +204,10 @@ def calc_ability_trend(data_file, word_map_file, max_steps, group_size=50, min_r
     target_users = None
     if selection:
         target_users = filter_users_by_abilities(data_file, selection=selection)
+
+
+    kt_evaluator = KTEvaluator()
+    
 
     user_step_abilities = [] # 4层列表 user_cnt, interaction_cnt, interaction_words, 2
     with open(data_file, 'r') as fp:
