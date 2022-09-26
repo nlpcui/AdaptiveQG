@@ -40,6 +40,27 @@ def ascii_decode(x):
 
 
 
+def check_binary_matrix(matrix):
+    records = []
+
+    for i, row in enumerate(matrix):
+        row_short = []
+        pre_value = None
+        cnt = 0
+        for j, value in enumerate(row):
+            if pre_value is not None and pre_value != value:
+                row_short.append('{}*{}'.format(pre_value, cnt))
+                cnt = 0
+            cnt += 1
+            pre_value = value
+
+        row_short.append('{}*{}'.format(pre_value, cnt))
+        
+        records.append(row_short)
+
+    return records
+
+
 def format_distribution(distr, total):
     distr = collections.OrderedDict(sorted(distr.items(), key=lambda x:x[0]))
     acc = 0

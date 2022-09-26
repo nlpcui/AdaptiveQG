@@ -173,7 +173,6 @@ class KTEvaluator:
                     logging.info('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(data['user_id']), split))
                     continue # no such split data
                 
-
                 valid_logits = data['logits'][valid_positions] # flat
                 valid_labels = data['labels'][valid_positions] # flat
                 

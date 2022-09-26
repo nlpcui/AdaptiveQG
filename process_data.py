@@ -462,12 +462,14 @@ class KTTokenizer:
 
 
 class DuolingoKTDataset(Dataset):
-    def __init__(self, raw_data_file, data_dir, word_file, w_l_tuple_file, max_seq_len, target_split, label_pad_id=-100, interaction_pad_id=-100, max_lines=-1):
+    def __init__(self, raw_data_file, data_dir, word_file, w_l_tuple_file, max_seq_len, target_split, label_pad_id=-100, interaction_pad_id=-100, max_lines=-1, discard_rate=0.5):
         
         self.max_seq_len = max_seq_len
         self.label_pad_id = label_pad_id
         self.target_split = target_split
         self.interaction_pad_id = interaction_pad_id
+
+        self.discard_rate = discard_rate
 
         self.word_map = {
             '<pad>': 0,
@@ -522,6 +524,9 @@ class DuolingoKTDataset(Dataset):
             if line_cnt >= max_lines > 0:
                 break
             data = np.load(os.path.join(data_dir, filename))
+            train_steps = np.where(data['split_ids']==1, True, False).sum()
+            if train_steps < self.discard_rate * data['valid_lengths'][0]:
+                continue
             self.data.append({key: data[key] for key in data})
             # print(sizeof(self.data[-1])/1024/1024)
         
@@ -633,7 +638,8 @@ class DuolingoKTDataset(Dataset):
         for target_idx in range(seq_len): # row
             for source_idx in range(seq_len): # column
                 if data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
-                    word_attn_mask[target_idx][source_idx] = False
+                    word_attn_mask[target_idx][source_idx] = False 
+                    # (1) special_tokens attend to special tokens, and (2) words attend within the same interaction
                 # elif data['interaction_ids'][target_idx] < data['interaction_ids'][source_idx]:
                 #     break
         
@@ -646,15 +652,35 @@ class DuolingoKTDataset(Dataset):
         
         for target_idx in range(seq_len): # row
             if target_idx == 0:
-                w_l_tuple_attn_mask[0][0] = False
-            elif target_idx == seq_len -1:
-                w_l_tuple_attn_mask[target_idx] = [False for i in range(seq_len)]
+                w_l_tuple_attn_mask[0][0] = False # <bos> attends only <bos>
+            elif target_idx == seq_len - 1:
+                w_l_tuple_attn_mask[target_idx] = [False for i in range(seq_len)] # <eos> attends all
             else:
                 for source_idx in range(seq_len): # column
-                    if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx]:
+                    if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] > self.interaction_pad_id:
                         w_l_tuple_attn_mask[target_idx][source_idx] = False # attend to previous interactions
                     elif data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx] == self.interaction_pad_id:
                         w_l_tuple_attn_mask[target_idx][source_idx] == False # pad tokens attend to pad tokens
+
+        return w_l_tuple_attn_mask
+
+
+    def __build_causal_attn_mask(self, data, self_attn):
+        seq_len = len(data['word_ids'])
+        causal_attn_mask = [[True for i in range(seq_len)] for j in range(seq_len)]
+
+        for target_idx in range(seq_len): # row
+            if target_idx == 0:
+                w_l_tuple_attn_mask[0][0] = False # <bos> attends only <bos>
+            elif target_idx == seq_len - 1:
+                w_l_tuple_attn_mask[target_idx] = [False for i in range(seq_len)] # <eos> attends all
+            else:
+                for source_idx in range(seq_len): # column
+                    if data['interaction_ids'][target_idx] > data['interaction_ids'][source_idx] > self.interaction_pad_id:
+                        w_l_tuple_attn_mask[target_idx][source_idx] = False # attend to previous interactions
+                    elif data['interaction_ids'][target_idx] == data['interaction_ids'][source_idx]:
+                        if data['interaction_ids'][source_idx] == self.interaction_pad_id or self_attn:
+                            w_l_tuple_attn_mask[target_idx][source_idx] == False # pad tokens attend to pad tokens
 
         return w_l_tuple_attn_mask
 
@@ -687,13 +713,12 @@ class DuolingoKTDataset(Dataset):
         if seq_pad_length <= 0:
             return 
 
-
-        pad_word_ids = [self.word_map['<pad>'] for i in range(seq_pad_length)]
-        pad_w_l_tuple_ids = [self.w_l_tuple_map['<pad>'] for i in range(seq_pad_length)]
-        pad_task_ids = [self.task_map['<pad>'] for i in range(seq_pad_length)]
-        pad_labels = [self.label_pad_id for i in range(seq_pad_length)]
-        pad_split_ids = [self.split_map['<pad>'] for i in range(seq_pad_length)]
-        pad_interaction_ids = [self.interaction_pad_id for i in range(seq_pad_length)] # TODO: 是否-100 做填充？
+        # pad_word_ids = [self.word_map['<pad>'] for i in range(seq_pad_length)]
+        # pad_w_l_tuple_ids = [self.w_l_tuple_map['<pad>'] for i in range(seq_pad_length)]
+        # pad_task_ids = [self.task_map['<pad>'] for i in range(seq_pad_length)]
+        # pad_labels = [self.label_pad_id for i in range(seq_pad_length)]
+        # pad_split_ids = [self.split_map['<pad>'] for i in range(seq_pad_length)]
+        # pad_interaction_ids = [self.interaction_pad_id for i in range(seq_pad_length)] # TODO: 是否-100 做填充？
 
         if direction == 'right':
             pad_width = (0, seq_pad_length)

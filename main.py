@@ -31,16 +31,15 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
     logging.info('-- local_rank: {}, building dataset ...'.format(local_rank))
     
     dataset = DuolingoKTDataset(
-        raw_data_file=args.duolingo_en_es_format,
+        raw_data_file=None, #args.duolingo_en_es_format,
         data_dir=args.kt_format_data_2048,
         word_file=args.duolingo_en_es_word_file, 
         w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
         max_seq_len=args.kt_max_seq_len,
         label_pad_id=int(args.kt_pad_label_id),
         target_split=['train', 'dev', 'test'],
-        max_lines=-1
+        max_lines=1000
     )
-    exit(1)
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
 
     model = KnowledgeTracer(
@@ -63,6 +62,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         alpha=args.kt_memory_weight,
         device=device
     ).to(device)
+
 
     # if local_rank == 0:
     #     for index in random.sample(range(len(dataset)), 3):
@@ -130,7 +130,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
 
         for batch_id, (x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions) in enumerate(dataloader):
             logging.debug('-- local rank {}, batch data:\n x_user_ids: {},\n x_user_abilities: {},\n x_word_ids: {},\n x_w_l_tuple_ids: {},\n x_position_ids: {},\n, x_task_ids: {},\n x_interaction_ids: {},\n y_labels: {},\n split_ids: {},\n x_word_attn_masks: {},\n x_w_l_tuple_attn_masks: {},\n.'.format(local_rank, x_user_ids, x_user_abilities, x_word_ids, x_w_l_tuple_ids, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_word_attn_masks, x_w_l_tuple_attn_masks))
-             
+            # checked: x_w_l_tuple_attn_mask, y_labels
             '''
             x_user_ids:             [batch_size, 5] 
             x_user_abilities:       [batch_size, 1]
@@ -153,6 +153,23 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             batch_seq_len = x_word_ids.size(1)
             batch_user_ids = [ascii_decode(user_id) for user_id in x_user_ids]
 
+            # check mask attn matrix
+            # attn_mask_list = x_w_l_tuple_attn_masks.numpy().tolist()
+            # label_seq = x_w_l_tuple_ids.numpy().tolist()
+            # for bid, seq in enumerate(label_seq):
+            #     print('batch_seq_len {}, valid_len {}, cur_len {}, pad_num {}'.format(batch_seq_len, x_valid_lengths[bid], len(seq), seq.count(0)))
+            #     print(seq)
+            #     print('-'*200)
+            # exit(1)
+            # for i, mask in enumerate(label_seq):
+            #     compressed = check_binary_matrix([mask])
+            #     print(x_valid_lengths[i], batch_seq_len-x_valid_lengths[i])
+            #     for j, row in enumerate(compressed):
+            #         print(j, row)
+            #     print('-'*200)
+            # exit(1)
+            # end check
+
             # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
             x_memory_update_matrix = (~(x_w_l_tuple_attn_masks.permute(0, 2, 1))).float()
             
@@ -166,6 +183,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
                 batch_seq_len, 
                 batch_seq_len, 
             )
+
 
             x_user_ids = x_user_ids.to(device)
             x_user_abilities = x_user_abilities.to(device)
@@ -209,11 +227,11 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             valid_steps_train = torch.where(y_labels_train>=0, True, False).sum()
             valid_steps_total = torch.where(y_labels_>=0, True, False).sum()
             
-            if valid_steps_train < 0.6 * valid_steps_total:
-                logging.warning('-- Rank {}, in {}/{} epoch, {}/{} batch, user_ids {}, train_steps({})/total_steps({})<0.6({}), discard!'.format(
-                    local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, valid_steps_train, valid_steps_total, valid_steps_train/valid_steps_total 
-                ))
-                continue 
+            # if valid_steps_train < args.kt_discard_rate * valid_steps_total:
+            #     logging.warning('-- Rank {}, in {}/{} epoch, {}/{} batch, user_ids {}, train_steps({})/total_steps({})<0.6({}), discard!'.format(
+            #         local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, valid_steps_train, valid_steps_total, valid_steps_train/valid_steps_total 
+            #     ))
+            #     continue 
 
             loss = loss_function(logits_, y_labels_train.to(device))
             epoch_loss += loss
@@ -224,7 +242,6 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             
             logging.info('Rank: {} In {}/{} epoch, {}/{} batch, batch_seq_len {}, valid_train_steps {}, total steps {}, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_seq_len, valid_steps_train, valid_steps_total, loss))
             
-            # exit(1)
 
         
         model.eval()
