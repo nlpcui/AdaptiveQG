@@ -1,5 +1,5 @@
 import sys, os, json, configparser, argparse, datetime, logging, math
-os.environ['CUDA_VISIBLE_DEVICES'] = '3' # "3,4,6,7"
+os.environ['CUDA_VISIBLE_DEVICES'] = '0' # 0, 7
 import torch
 from tqdm import tqdm
 from process_data import *
@@ -19,6 +19,15 @@ from copy import deepcopy
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 
+def setup_seed(seed):
+     torch.manual_seed(seed)
+     torch.cuda.manual_seed_all(seed)
+     np.random.seed(seed)
+     random.seed(seed)
+     torch.backends.cudnn.deterministic = True
+
+
+
 def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
     
     # num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, alpha=0.8, emb_padding_idx=0
@@ -32,16 +41,16 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
     
     dataset = DuolingoKTDataset(
         raw_data_file=None, #args.duolingo_en_es_format,
-        data_dir=args.kt_format_data_2048,
+        data_dir=args.kt_format_data_1024,
         word_file=args.duolingo_en_es_word_file, 
         w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
         max_seq_len=args.kt_max_seq_len,
         label_pad_id=int(args.kt_pad_label_id),
         target_split=['train', 'dev', 'test'],
-        max_lines=1000
+        max_lines=1000,
+        discard_rate=args.kt_discard_rate
     )
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
-
     model = KnowledgeTracer(
         num_words=dataset.num_words,
         num_w_l_tuples=dataset.num_w_l_tuples,
@@ -887,7 +896,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='local_conf.ini')
+    parser.add_argument('--conf', type=str, default='euler_conf.ini')
      
     args, remaining_argv = parser.parse_known_args()
     config = configparser.ConfigParser()
@@ -904,12 +913,13 @@ if __name__ == '__main__':
     
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(message)s', 
-        # filename=args.kt_train_log, 
+        filename=args.kt_train_log, 
         level=logging.INFO, 
-        filemode='a'
+        filemode='w'
     )
-
-
+    
+    setup_seed(args.random_seed)
+   
     gpu_cnt = torch.cuda.device_count() # gpu_cnt_per_machine
     global_rank = 0
     local_rank = 0

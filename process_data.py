@@ -525,7 +525,7 @@ class DuolingoKTDataset(Dataset):
                 break
             data = np.load(os.path.join(data_dir, filename))
             train_steps = np.where(data['split_ids']==1, True, False).sum()
-            if train_steps < self.discard_rate * data['valid_lengths'][0]:
+            if train_steps < self.discard_rate * data['valid_length'][0]:
                 continue
             self.data.append({key: data[key] for key in data})
             # print(sizeof(self.data[-1])/1024/1024)

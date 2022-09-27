@@ -108,8 +108,9 @@ class KnowledgeTracer(nn.Module):
 
         self.word_embeddings = nn.Embedding(num_words, dim_emb, padding_idx=emb_padding_idx)
         self.w_l_tuple_embeddings = nn.Embedding(num_w_l_tuples, dim_emb, padding_idx=emb_padding_idx) 
-
-        self.positional_embeddings = PostionalEncoding(dim_emb, max_seq_len=max_seq_len, device=device)
+        
+        self.positional_embeddings = nn.Embedding(dim_emb, max_seq_len=max_seq_len, device=device)
+        # self.positional_embeddings = PostionalEncoding(dim_emb, max_seq_len=max_seq_len, device=device)
         self.task_embeddings = nn.Embedding(num_tasks, dim_emb, padding_idx=emb_padding_idx)
         
         self.word_encoder = nn.ModuleList([
@@ -157,7 +158,7 @@ class KnowledgeTracer(nn.Module):
 
         w_l_tuple_embs = w_l_tuple_embs + task_embs + pos_embs
         word_embs = word_embs + task_embs + pos_embs
-
+        
         # intra-exercise context transformer
         # h_word_state = word_embs
         # for layer_id, word_encoding_layer in enumerate(self.word_encoder):
