@@ -100,18 +100,21 @@ class TransformerEncodingBlock(nn.Module):
 
 
 class KnowledgeTracer(nn.Module):
-    def __init__(self, num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, device='cpu', num_labels=2, alpha=0.8, emb_padding_idx=0):
+    def __init__(self, num_words, num_w_l_tuples, num_tasks, num_time, num_days, num_users, max_seq_len, dim_emb_word, dim_emb_tuple, dim_emb_task, dim_emb_position, dim_emb_time, dim_emb_days, dim_emb_user, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, ftr_comb='sum', device='cpu', num_labels=2, alpha=0.8, emb_padding_idx=0):
         super(KnowledgeTracer, self).__init__()
         
         self.alpha = alpha
         self.device = device
+        self.ftr_comb = ftr_comb
 
-        self.word_embeddings = nn.Embedding(num_words, dim_emb, padding_idx=emb_padding_idx)
-        self.w_l_tuple_embeddings = nn.Embedding(num_w_l_tuples, dim_emb, padding_idx=emb_padding_idx) 
-        
-        self.positional_embeddings = nn.Embedding(dim_emb, max_seq_len=max_seq_len, device=device)
+        self.word_embeddings = nn.Embedding(num_words, dim_emb_word, padding_idx=emb_padding_idx)
+        self.w_l_tuple_embeddings = nn.Embedding(num_w_l_tuples, dim_emb_tuple, padding_idx=emb_padding_idx) 
+        self.time_embeddings = nn.Embedding(num_time, dim_emb_time, padding_idx=emb_padding_idx)
+        self.days_embeddings = nn.Embedding(num_days, dim_emb_days, padding_idx=emb_padding_idx)
+        self.user_embeddings = nn.Embedding(num_users, dim_emb_user)
+        self.positional_embeddings = nn.Embedding(max_seq_len, dim_emb_position, device=device)
         # self.positional_embeddings = PostionalEncoding(dim_emb, max_seq_len=max_seq_len, device=device)
-        self.task_embeddings = nn.Embedding(num_tasks, dim_emb, padding_idx=emb_padding_idx)
+        self.task_embeddings = nn.Embedding(num_tasks, dim_emb_task, padding_idx=emb_padding_idx)
         
         self.word_encoder = nn.ModuleList([
             TransformerEncodingBlock(dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise) for i in range(num_exercise_encoder_layers)
@@ -134,7 +137,7 @@ class KnowledgeTracer(nn.Module):
         self.ff_output_memory_neg_2 = nn.Linear(2*num_words, num_words, bias=True)
 
 
-    def forward(self, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, x_memory_update_matrix):
+    def forward(self, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_user_ids, x_days, x_time, x_interaction_ids, x_memory_update_matrix):
         '''
         x_word_ids:                 [batch_size, seq_len]
         x_w_l_tuple_ids:            [batch_size, seq_len]
@@ -149,15 +152,27 @@ class KnowledgeTracer(nn.Module):
         batch_size = x_word_ids.size(0)
         seq_len = x_word_ids.size(1)
 
-        pos_embs = self.positional_embeddings(x_word_ids)
-        task_embs = self.task_embeddings(x_task_ids)
-
         word_embs = self.word_embeddings(x_word_ids) 
         w_l_tuple_embs = self.w_l_tuple_embeddings(x_w_l_tuple_ids) 
         
+        pos_embs = self.positional_embeddings(x_position_ids)
+        task_embs = self.task_embeddings(x_task_ids)
+        days_embs = self.days_embeddings(x_days)
+        time_embs = self.time_embeddings(x_time)
+        user_embs = self.user_embeddings(x_user_ids).unsqueeze(1)        
 
-        w_l_tuple_embs = w_l_tuple_embs + task_embs + pos_embs
-        word_embs = word_embs + task_embs + pos_embs
+        if self.ftr_comb == 'sum':
+            # print('w_l_tuple_embs', w_l_tuple_embs.shape)
+            # print('task_embs', task_embs.shape)
+            # print('pos_embs', pos_embs.shape)
+            # print('days_embs', days_embs.shape)
+            # print('time_embs', time_embs.shape)
+            # print('user_embs', user_embs.shape)
+            w_l_tuple_embs = w_l_tuple_embs + task_embs + pos_embs + days_embs + time_embs + user_embs
+            word_embs = word_embs + task_embs + pos_embs + days_embs + time_embs + user_embs
+
+        elif self.ftr_comb == 'concat':
+            pass
         
         # intra-exercise context transformer
         # h_word_state = word_embs

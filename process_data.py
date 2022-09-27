@@ -28,8 +28,10 @@ class InteractionLog:
         self.exercise = [] # list of ExerciseItem
 
     def parse_from_line(self, line):
+
         line = re.sub(' +', ' ', line)
         fields = line.split(' ')
+
         for field_ in fields:
             name_, value = field_.split(':')
             if name_ == 'user':
@@ -45,7 +47,7 @@ class InteractionLog:
             elif name_ == "format":
                 self.format = value
             elif name_ == "time":
-                self.time = int(value) if type(value)==int else 0
+                self.time = int(value) if is_int(value) else 0
 
 
     def to_dict(self):
@@ -102,7 +104,7 @@ def auto_convert(x):
         
 
 
-def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, format_output, word_file, w_l_tuple_file, exercise_file, non_adaptive_gen_file, build_kt=True, build_gen_non_adaptive=True, un_cased=True):
+def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, format_output, word_file, w_l_tuple_file, exercise_file, user_file, non_adaptive_gen_file, build_kt=True, build_gen_non_adaptive=True, un_cased=True):
     '''
     Input:
     train_raw: train_set (txt)
@@ -119,6 +121,7 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
     word_map = {} 
     w_l_tuple_map = {} # w_l_tuple, id, freq
     exercise_map = {} # exercise, freq, correct_cnt, error_cnt, average_num_errors
+    user_map = {}
 
     # read train
     logging.info('-- reading train data...')
@@ -163,6 +166,12 @@ def build_dataset(train_raw, dev_raw, dev_key_raw, test_raw, test_key_raw, forma
 
     df = pd.DataFrame(exercise_map.values(), columns=['exercise', 'cnt', 'exercise_error_cnt', 'word_error_cnt', 'exercise_error_rate', 'avg_word_error_cnt', 'sum_word_error_rate'])
     df.to_csv(exercise_file, index=False)
+
+    # save user_map
+    logging.info('-- saving users to {}'.format(user_file))
+    user_map = {user_name: {'user_name': user_name, 'user_id': i} for (i, user_name) in enumerate(user_interactions.keys())}
+    df = pd.DataFrame(user_map.values(), columns=['user_name', 'user_id'])
+    df.to_csv(user_file, index=False) 
 
     ## compute user_ability: correct_rate * ave_difficulty
     for user in user_interactions:
@@ -346,7 +355,10 @@ def get_statistics(data_file, target_split=None):
         'length_distribution': {},                   # word per user
         'max_length': float('-inf'),                  
         'min_length': float('inf'),
-        'avg_length': .0
+        'avg_length': .0,
+
+        'days_distribution': {},
+        'time_distribution': {},
     }
 
     with open(data_file, 'r') as fp:
@@ -363,6 +375,14 @@ def get_statistics(data_file, target_split=None):
                 interaction_cnt += len(data[split])
                 
                 for interaction in data[split]:
+                    if interaction['days'] not in stats['days_distribution']:
+                        stats['days_distribution'][interaction['days']] = 0
+                    stats['days_distribution'][interaction['days']] += 1
+
+                    if interaction['time'] not in stats['time_distribution']:
+                        stats['time_distribution'][interaction['time']] = 0
+                    stats['time_distribution'][interaction['time']] += 1    
+
                     word_cnt += len(interaction['exercise'])
 
                     ## interaction_length_distribution distribution
@@ -403,11 +423,11 @@ def get_statistics(data_file, target_split=None):
             stats['interaction_num_distribution'][bucket] += 1
 
                 
-            
-
     stats['length_distribution'] = format_distribution(stats['length_distribution'], stats['user_cnt'])
     stats['interaction_num_distribution'] = format_distribution(stats['interaction_num_distribution'], stats['user_cnt'])
     stats['interaction_length_distribution'] = format_distribution(stats['interaction_length_distribution'], stats['interaction_cnt'])
+    stats['days_distribution'] = format_distribution(stats['days_distribution'], stats['interaction_cnt'])
+    stats['time_distribution'] = format_distribution(stats['time_distribution'], stats['interaction_cnt'])
     pprint(stats)
 
 
@@ -462,14 +482,19 @@ class KTTokenizer:
 
 
 class DuolingoKTDataset(Dataset):
-    def __init__(self, raw_data_file, data_dir, word_file, w_l_tuple_file, max_seq_len, target_split, label_pad_id=-100, interaction_pad_id=-100, max_lines=-1, discard_rate=0.5):
+    def __init__(self, raw_data_file, data_dir, word_file, w_l_tuple_file, user_file, max_seq_len, target_split, label_pad_id=-100, interaction_pad_id=-100, time_pad_id=0, days_pad_id=0, max_lines=-1, discard_rate=0.5):
         
         self.max_seq_len = max_seq_len
         self.label_pad_id = label_pad_id
+        self.days_pad_id = days_pad_id
+        self.time_pad_id = time_pad_id
         self.target_split = target_split
         self.interaction_pad_id = interaction_pad_id
 
         self.discard_rate = discard_rate
+        
+        self.num_days = 23
+        self.num_time = 9
 
         self.word_map = {
             '<pad>': 0,
@@ -507,7 +532,12 @@ class DuolingoKTDataset(Dataset):
             'test': 3 
         }
 
-
+        self.user_map = {}
+        df_users = pd.read_csv(user_file)
+        for idx, row in df_users.iterrows():
+            self.user_map[row['user_name']] = row['user_id']
+        self.num_users = len(self.user_map)
+        
         self.num_words = len(self.word_map)
         self.num_w_l_tuples = len(self.w_l_tuple_map)
         self.num_tasks = len(self.task_map)
@@ -544,7 +574,7 @@ class DuolingoKTDataset(Dataset):
                 idx += 1
                 user_log = json.loads(line.strip())
                 format_data = self.format(user_log)
-                filename = '{}.npz'.format('-'.join([str(num) for num in format_data['user_id']]))
+                filename = '{}.npz'.format('-'.join([str(num) for num in format_data['user_ascii']]))
                 save_path = os.path.join(dirname, filename)
                 np.savez(save_path, **format_data) 
                 line = fp.readline()
@@ -555,7 +585,8 @@ class DuolingoKTDataset(Dataset):
     def format(self, user_log, padding=False, truncation=True):
         # format SINGLE user_log to train data
         instance = {
-            'user_id': ascii_encode(user_log['user_id']),
+            'user_ascii': ascii_encode(user_log['user_id']),
+            'user_id': self.user_map[user_log['user_id']],
             'user_ability': [user_log['user_ability']],
             'word_ids': [],
             'word_attn_mask': None,
@@ -566,6 +597,8 @@ class DuolingoKTDataset(Dataset):
             'interaction_ids': [],
             'labels': [],
             'split_ids': [],
+            'days': [],
+            'time': []
         }
 
         instance['word_ids'].append(self.word_map['<bos>'])
@@ -574,6 +607,8 @@ class DuolingoKTDataset(Dataset):
         instance['interaction_ids'].append(-1)
         instance['labels'].append(self.label_pad_id)
         instance['split_ids'].append(self.split_map['<pad>'])
+        instance['days'].append(self.days_pad_id)
+        instance['time'].append(self.time_pad_id)
 
         cur_interaction_id = 0
         # words = []
@@ -581,6 +616,8 @@ class DuolingoKTDataset(Dataset):
             if self.target_split and split not in self.target_split:
                 continue 
             for interaction_id, interaction in enumerate(user_log[split]):
+                days = self.discretize_days(interaction['days'])
+                time = self.discretize_time(interaction['time'])
                 for idx, item in enumerate(interaction['exercise']):
                     # words.append(item['text'])
                     instance['word_ids'].append(self.word_map.get(item['text'], self.word_map['<unk>']))
@@ -589,6 +626,8 @@ class DuolingoKTDataset(Dataset):
                     instance['labels'].append(item['label'])
                     instance['split_ids'].append(self.split_map[split])
                     instance['interaction_ids'].append(cur_interaction_id)
+                    instance['days'].append(days)
+                    instance['time'].append(time)
                 
                 cur_interaction_id += 1
 
@@ -598,6 +637,8 @@ class DuolingoKTDataset(Dataset):
         instance['interaction_ids'].append(cur_interaction_id)
         instance['split_ids'].append(self.split_map['<pad>'])
         instance['labels'].append(self.label_pad_id)
+        instance['days'].append(self.days_pad_id)
+        instance['time'].append(self.time_pad_id)
 
         instance['position_ids'] = [i for i in range(len(instance['word_ids']))]
         
@@ -629,6 +670,39 @@ class DuolingoKTDataset(Dataset):
             if not (row == False).any():
                 return idx, row.shape
         return None
+
+
+    def discretize_time(self, time):
+        # size 9
+        if time < 0:
+            return 0 # invalid pad
+        elif time <= 3:
+            return 1
+        elif 3 < time <=5:
+            return 2
+        elif 5 < time <= 10:
+            return 3
+        elif 10 < time <= 15:
+            return 4
+        elif 15 < time <= 20:
+            return 5
+        elif 20 < time <= 30:
+            return 6
+        elif 30 < time <= 50:
+            return 7
+        else:
+            return 8
+    
+    def discretize_days(self, days):
+        # size 23
+        if days < 0:
+            return 0 # pad
+        elif days < 20:
+            return int(days) + 1
+        elif 20 <= days < 25:
+            return 21
+        else:
+            return 22 
 
 
     def __build_word_attn_mask(self, data):
@@ -723,9 +797,11 @@ class DuolingoKTDataset(Dataset):
         if direction == 'right':
             pad_width = (0, seq_pad_length)
             attn_pad_width = ((0, seq_pad_length), (0, seq_pad_length))
+            tokenized['position_ids'] = np.array([i for i in range(max_seq_len-seq_pad_length)] + [0 for i in range(seq_pad_length)])
         elif direction == 'left':
             pad_width = (seq_pad_length, 0)
             attn_pad_width = ((seq_pad_length, 0), (seq_pad_length, 0))
+            tokenized['position_ids'] = np.array([0 for i in range(seq_pad_length)]+[i for i in range(max_seq_len-seq_pad_length)])
         
         tokenized['word_ids'] = np.pad(tokenized['word_ids'], pad_width, constant_values=(self.word_map['<pad>'], self.word_map['<pad>']))
         tokenized['w_l_tuple_ids'] = np.pad(tokenized['w_l_tuple_ids'], pad_width, constant_values=(self.w_l_tuple_map['<pad>'], self.w_l_tuple_map['<pad>']))
@@ -733,8 +809,8 @@ class DuolingoKTDataset(Dataset):
         tokenized['labels'] = np.pad(tokenized['labels'], pad_width, constant_values=(self.label_pad_id, self.label_pad_id))
         tokenized['split_ids'] = np.pad(tokenized['split_ids'], pad_width, constant_values=(self.split_map['<pad>'], self.split_map['<pad>']))
         tokenized['interaction_ids'] = np.pad(tokenized['interaction_ids'], pad_width, constant_values=(self.interaction_pad_id, self.interaction_pad_id))
-    
-        tokenized['position_ids'] = np.array([i for i in range(max_seq_len)])
+        tokenized['days'] = np.pad(tokenized['days'], pad_width, constant_values=(self.days_pad_id, self.days_pad_id))
+        tokenized['time'] = np.pad(tokenized['time'], pad_width, constant_values=(self.time_pad_id, self.time_pad_id))
 
         tokenized['word_attn_mask'] = np.pad(tokenized['word_attn_mask'], attn_pad_width, constant_values=((False, False), (True, True)))
         tokenized['w_l_tuple_attn_mask'] = np.pad(tokenized['w_l_tuple_attn_mask'], attn_pad_width, constant_values=((False, False), (True, True)))
@@ -757,6 +833,8 @@ class DuolingoKTDataset(Dataset):
             tokenized['split_ids'] = np.concatenate([tokenized['split_ids'][:max_seq_len-1], np.array([self.split_map['<pad>']])])
             tokenized['interaction_ids'] = np.concatenate([tokenized['interaction_ids'][:max_seq_len-1], np.array([tokenized['interaction_ids'][-1]+1])])
             tokenized['valid_interactions'][0] = tokenized['interaction_ids'][-1] + 1
+            tokenized['days'] = tokenized['days'][:max_seq_len]
+            tokenized['time'] = tokenized['time'][:max_seq_len]
             tokenized['position_ids'] = tokenized['position_ids'][:max_seq_len]
 
             # truncate attn mask
@@ -777,6 +855,8 @@ class DuolingoKTDataset(Dataset):
             tokenized['labels'] = np.concatenate([np.array([self.label_pad_id]), tokenized['labels'][trunc_length+1:]]) 
             tokenized['split_ids'] = np.concatenate([np.array([self.split_map['<pad>']]), tokenized['split_ids'][trunc_length+1:]])
             tokenized['position_ids'] = np.array([i for i in range(max_seq_len)])
+            tokenized['days'] = np.concatenate([np.array([self.days_pad_id]), tokenized['days'][trunc_length+1:]])
+            tokenized['time'] = np.concatenate([np.array([self.time_pad_id]), tokenized['time'][trunc_length+1:]])
             
             start_interaction = tokenized['interaction_ids'][trunc_length+1]
             tokenized['interaction_ids'] = np.concatenate([np.array([-1]), tokenized['interaction_ids'][trunc_length+1:]-start_interaction])
@@ -819,7 +899,7 @@ class DuolingoKTDataset(Dataset):
                 self.pad(data, max_seq_len=batch_max_seq_len, direction=direction)
             #     print('after truncate and pad', data['interaction_ids'].shape)
             # exit(1)
-
+            x_user_ascii = torch.tensor(np.stack([data['user_ascii'] for data in batch_data], axis=0))
             x_user_ids = torch.tensor(np.stack([data['user_id'] for data in batch_data], axis=0))
             x_user_abilities = torch.tensor(np.stack([data['user_ability'] for data in batch_data], axis=0))
             x_word_ids = torch.tensor(np.stack([data['word_ids'] for data in batch_data], axis=0))
@@ -828,13 +908,15 @@ class DuolingoKTDataset(Dataset):
             x_w_l_tuple_attn_masks = torch.tensor(np.stack([data['w_l_tuple_attn_mask'] for data in batch_data], axis=0))
             x_position_ids = torch.tensor(np.stack([data['position_ids'] for data in batch_data], axis=0))
             x_task_ids = torch.tensor(np.stack([data['task_ids'] for data in batch_data], axis=0))
+            x_days = torch.tensor(np.stack([data['days'] for data in batch_data], axis=0))
+            x_time = torch.tensor(np.stack([data['time'] for data in batch_data], axis=0))
             x_interaction_ids = torch.tensor(np.stack([data['interaction_ids'] for data in batch_data], axis=0))
             y_labels = torch.tensor(np.stack([data['labels'] for data in batch_data], axis=0))
             split_ids = torch.tensor(np.stack([data['split_ids'] for data in batch_data], axis=0)) # 0 train, 1 dev, 2 test
             x_valid_lengths = torch.tensor(np.stack([data['valid_length'] for data in batch_data], axis=0))
             x_valid_interactions = torch.tensor(np.stack([data['valid_interactions'] for data in batch_data], axis=0))
 
-            return x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions
+            return x_user_ascii, x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_days, x_time, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions
 
 
         return collate_fn
@@ -1098,17 +1180,18 @@ if __name__ == '__main__':
 
     # stats = get_statistics('/Users/cuipeng/Documents/Datasets/duolingo_2018_shared_task/data_en_es/en_es_format.jsonl', target_split=None)
     
-    # build_dataset(
-    #     train_raw=args.duolingo_en_es_train_raw, 
-    #     dev_raw=args.duolingo_en_es_dev_raw, 
-    #     dev_key_raw=args.duolingo_en_es_dev_key_raw, 
-    #     test_raw=args.duolingo_en_es_test_raw, 
-    #     test_key_raw=args.duolingo_en_es_test_key_raw, 
-    #     format_output=args.duolingo_en_es_format, 
-    #     w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
-    #     word_file=args.duolingo_en_es_word_file, 
-    #     exercise_file=args.duolingo_en_es_exercise_file, 
-    #     non_adaptive_gen_file=args.duolingo_en_es_non_adaptive_exercise_gen,
-    #     build_kt=True,
-    #     build_gen_non_adaptive=False
-    # )
+    build_dataset(
+        train_raw=args.duolingo_en_es_train_raw, 
+        dev_raw=args.duolingo_en_es_dev_raw, 
+        dev_key_raw=args.duolingo_en_es_dev_key_raw, 
+        test_raw=args.duolingo_en_es_test_raw, 
+        test_key_raw=args.duolingo_en_es_test_key_raw, 
+        format_output=args.duolingo_en_es_format, 
+        w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
+        word_file=args.duolingo_en_es_word_file, 
+        exercise_file=args.duolingo_en_es_exercise_file, 
+        user_file=args.duolingo_en_es_user_file,
+        non_adaptive_gen_file=args.duolingo_en_es_non_adaptive_exercise_gen,
+        build_kt=True,
+        build_gen_non_adaptive=False
+    )

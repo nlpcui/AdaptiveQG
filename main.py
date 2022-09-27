@@ -44,6 +44,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         data_dir=args.kt_format_data_1024,
         word_file=args.duolingo_en_es_word_file, 
         w_l_tuple_file=args.duolingo_en_es_w_l_tuple_file, 
+        user_file=args.duolingo_en_es_user_file,
         max_seq_len=args.kt_max_seq_len,
         label_pad_id=int(args.kt_pad_label_id),
         target_split=['train', 'dev', 'test'],
@@ -51,12 +52,22 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         discard_rate=args.kt_discard_rate
     )
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
+
     model = KnowledgeTracer(
         num_words=dataset.num_words,
         num_w_l_tuples=dataset.num_w_l_tuples,
         num_tasks=dataset.num_tasks, 
-        dim_emb=args.kt_dim_emb, 
+        num_users=dataset.num_users,
+        num_days=dataset.num_days,
+        num_time=dataset.num_time,
         max_seq_len=args.kt_max_seq_len, 
+        dim_emb_word=args.kt_dim_emb_word,
+        dim_emb_tuple=args.kt_dim_emb_tuple,
+        dim_emb_position=args.kt_dim_emb_position,
+        dim_emb_time=args.kt_dim_emb_time,
+        dim_emb_days=args.kt_dim_emb_days,
+        dim_emb_task=args.kt_dim_emb_task, 
+        dim_emb_user=args.kt_dim_emb_user,
         num_exercise_encoder_layers=args.kt_num_exercise_encoder_layers, 
         dim_attn_exercise=args.kt_dim_attn_exercise, 
         num_attn_heads_exercise=args.kt_num_attn_heads_exercise,
@@ -69,7 +80,8 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         dropout_interaction=args.kt_dropout_interaction, 
         num_labels=args.kt_num_labels,
         alpha=args.kt_memory_weight,
-        device=device
+        device=device,
+        ftr_comb='sum'
     ).to(device)
 
 
@@ -137,8 +149,8 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         epoch_loss = 0
         model.train()
 
-        for batch_id, (x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions) in enumerate(dataloader):
-            logging.debug('-- local rank {}, batch data:\n x_user_ids: {},\n x_user_abilities: {},\n x_word_ids: {},\n x_w_l_tuple_ids: {},\n x_position_ids: {},\n, x_task_ids: {},\n x_interaction_ids: {},\n y_labels: {},\n split_ids: {},\n x_word_attn_masks: {},\n x_w_l_tuple_attn_masks: {},\n.'.format(local_rank, x_user_ids, x_user_abilities, x_word_ids, x_w_l_tuple_ids, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_word_attn_masks, x_w_l_tuple_attn_masks))
+        for batch_id, (x_user_ascii, x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_days, x_time, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions) in enumerate(dataloader):
+            logging.debug('-- local rank {}, batch data:\n x_user_ascii: {},\n x_user_ids: {},\n x_user_abilities: {},\n x_word_ids: {},\n x_w_l_tuple_ids: {},\n x_position_ids: {},\n, x_task_ids: {},\n x_interaction_ids: {},\n y_labels: {},\n split_ids: {},\n x_word_attn_masks: {},\n x_w_l_tuple_attn_masks: {},\n.'.format(local_rank, x_user_ascii, x_user_ids, x_user_abilities, x_word_ids, x_w_l_tuple_ids, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_word_attn_masks, x_w_l_tuple_attn_masks))
             # checked: x_w_l_tuple_attn_mask, y_labels
             '''
             x_user_ids:             [batch_size, 5] 
@@ -160,7 +172,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             batch_size = x_user_ids.size(0) # for last batch
             logging.debug('x_word_ids shape {}'.format(x_word_ids.shape))
             batch_seq_len = x_word_ids.size(1)
-            batch_user_ids = [ascii_decode(user_id) for user_id in x_user_ids]
+            batch_user_ascii = [ascii_decode(user_ascii) for user_ascii in x_user_ascii]
 
             # check mask attn matrix
             # attn_mask_list = x_w_l_tuple_attn_masks.numpy().tolist()
@@ -218,6 +230,9 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
                 x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
                 x_position_ids=x_position_ids,
                 x_task_ids=x_task_ids,
+                x_days=x_days,
+                x_time=x_time,
+                x_user_ids=x_user_ids,
                 x_interaction_ids=x_interaction_ids,
                 x_memory_update_matrix=x_memory_update_matrix
             )   # logits: [batch_size, seq_len] # memory_states: [batch_size, num_interactions]
@@ -250,16 +265,17 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             lr_scheduler.step()
             
             logging.info('Rank: {} In {}/{} epoch, {}/{} batch, batch_seq_len {}, valid_train_steps {}, total steps {}, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_seq_len, valid_steps_train, valid_steps_total, loss))
+
+            exit(1)
             
 
         
         model.eval()
         kt_evaluator = KTEvaluator(num_words=dataset.num_words)
 
-        for batch_id, (x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions) in enumerate(dataloader):
+        for batch_id, (x_user_ascii, x_user_ids, x_user_abilities, x_word_ids, x_word_attn_masks, x_w_l_tuple_ids, x_w_l_tuple_attn_masks, x_position_ids, x_task_ids, x_days, x_time, x_interaction_ids, y_labels, split_ids, x_valid_lengths, x_valid_interactions) in enumerate(dataloader):
             batch_size = x_user_ids.size(0) # for last batch
             batch_seq_len = x_word_ids.size(1)
-            batch_user_ids = [ascii_decode(user_id) for user_id in x_user_ids]
 
             # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
             x_memory_update_matrix = (~(x_w_l_tuple_attn_masks.permute(0, 2, 1))).float()
@@ -299,6 +315,9 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
                 x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
                 x_position_ids=x_position_ids,
                 x_task_ids=x_task_ids,
+                x_days=x_days,
+                x_time=x_time,
+                x_user_ids=x_user_ids,
                 x_interaction_ids=x_interaction_ids,
                 x_memory_update_matrix=x_memory_update_matrix
             )   # logits: [batch_size, seq_len] # memory_states: [batch_size, batch_seq_len, num_words, 2]
@@ -329,7 +348,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
                 pad_memory_states = torch.nn.functional.pad(memory_states, pad=(0, 0, 0, args.kt_max_seq_len-pad_memory_states.size(1)))
 
                 # collect evaluation data
-                batch_user_ids = [torch.zeros_like(x_user_ids, device=device) for i in range(gpu_cnt)]
+                batch_user_ascii = [torch.zeros_like(x_user_ascii, device=device) for i in range(gpu_cnt)]
                 batch_user_abilities = [torch.zeros_like(x_user_abilities, device=device) for i in range(gpu_cnt)]
                 batch_logits = [torch.zeros_like(pad_logits, device=device) for i in range(gpu_cnt)]
                 batch_labels = [torch.zeros_like(pad_labels, device=device) for i in range(gpu_cnt)]
@@ -339,7 +358,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
                 batch_valid_length = [torch.zeros_like(x_valid_lengths, device=device) for i in range(gpu_cnt)] 
                 batch_valid_interactions = [torch.zeros_like(x_valid_interactions, device=device) for i in range(gpu_cnt)] 
 
-                dist.all_gather(batch_user_ids, x_user_ids.to(device))
+                dist.all_gather(batch_user_ascii, x_user_ids.to(device))
                 dist.all_gather(batch_user_abilities, x_user_abilities.to(device))
                 dist.all_gather(batch_logits, pad_logits)
                 dist.all_gather(batch_labels, pad_labels)
@@ -351,7 +370,7 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
 
                 for bid in range(batch_size):
                     kt_evaluator.add(
-                        user_id=batch_user_ids[bid].cpu().numpy(), 
+                        user_id=batch_user_ascii[bid].cpu().numpy(), 
                         user_ability=batch_user_abilities[bid].cpu().numpy(), 
                         logits=batch_logits[bid].detach().cpu().numpy(), 
                         labels=batch_lables[bid].cpu().numpy(), 
@@ -896,7 +915,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='euler_conf.ini')
+    parser.add_argument('--conf', type=str, default='local_conf.ini')
      
     args, remaining_argv = parser.parse_known_args()
     config = configparser.ConfigParser()
@@ -913,7 +932,7 @@ if __name__ == '__main__':
     
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(message)s', 
-        filename=args.kt_train_log, 
+        # filename=args.kt_train_log, 
         level=logging.INFO, 
         filemode='w'
     )
