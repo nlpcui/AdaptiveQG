@@ -1,4 +1,4 @@
-import os, sys, json, math, collections
+import os, sys, json, math, collections, torch
 import numpy as np
 import pandas as pd
 from pprint import pprint
@@ -39,6 +39,15 @@ def ascii_decode(x):
     return ''.join(result)
 
 
+def shift_sequence(sequence, offset):
+    seq_len = sequence.size(1)
+    if offset > 0: # shift right
+        sequence = torch.cat([sequence[:, seq_len-offset:], sequence[:,:seq_len-offset]], dim=-1)
+    elif offset < 0: # shift left
+        sequence = torch.cat([sequence[:, -offset:], sequence[:, :-offset]], dim=-1)
+    
+    return sequence
+
 
 def check_binary_matrix(matrix):
     records = []
@@ -60,6 +69,13 @@ def check_binary_matrix(matrix):
 
     return records
 
+
+def is_int(number):
+    try:
+        int(number)
+        return True
+    except:
+        return False
 
 def format_distribution(distr, total):
     distr = collections.OrderedDict(sorted(distr.items(), key=lambda x:x[0]))

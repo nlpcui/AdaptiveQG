@@ -28,7 +28,7 @@ def setup_seed(seed):
 
 
 
-def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
+def train_kt(args, local_rank, gpu_cnt, device, model_name='DKT', use_dev=False):
     
     # num_words, num_w_l_tuples, num_tasks, max_seq_len, dim_emb, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, alpha=0.8, emb_padding_idx=0
     if gpu_cnt > 0:
@@ -48,41 +48,52 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         max_seq_len=args.kt_max_seq_len,
         label_pad_id=int(args.kt_pad_label_id),
         target_split=['train', 'dev', 'test'],
-        max_lines=1000,
+        max_lines=-1,
         discard_rate=args.kt_discard_rate
     )
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
-
-    model = KnowledgeTracer(
-        num_words=dataset.num_words,
-        num_w_l_tuples=dataset.num_w_l_tuples,
-        num_tasks=dataset.num_tasks, 
-        num_users=dataset.num_users,
-        num_days=dataset.num_days,
-        num_time=dataset.num_time,
-        max_seq_len=args.kt_max_seq_len, 
-        dim_emb_word=args.kt_dim_emb_word,
-        dim_emb_tuple=args.kt_dim_emb_tuple,
-        dim_emb_position=args.kt_dim_emb_position,
-        dim_emb_time=args.kt_dim_emb_time,
-        dim_emb_days=args.kt_dim_emb_days,
-        dim_emb_task=args.kt_dim_emb_task, 
-        dim_emb_user=args.kt_dim_emb_user,
-        num_exercise_encoder_layers=args.kt_num_exercise_encoder_layers, 
-        dim_attn_exercise=args.kt_dim_attn_exercise, 
-        num_attn_heads_exercise=args.kt_num_attn_heads_exercise,
-        num_interaction_encoder_layers=args.kt_num_interaction_encoder_layers,
-        dim_attn_interaction=args.kt_dim_attn_interaction,
-        num_attn_heads_interaction=args.kt_num_attn_heads_interaction, 
-        dim_ff_exercise=args.kt_dim_ff_exercise, 
-        dropout_exercise=args.kt_dropout_exercise, 
-        dim_ff_interaction=args.kt_dim_ff_interaction, 
-        dropout_interaction=args.kt_dropout_interaction, 
-        num_labels=args.kt_num_labels,
-        alpha=args.kt_memory_weight,
-        device=device,
-        ftr_comb='sum'
-    ).to(device)
+    
+    logging.info('Rank {}, initializing model {}...'.format(local_rank, model_name))
+    if model_name == 'SAKT':
+        model = SAKT(
+            num_words=dataset.num_words,
+            num_w_l_tuples=dataset.num_w_l_tuples,
+            num_tasks=dataset.num_tasks, 
+            num_users=dataset.num_users,
+            num_days=dataset.num_days,
+            num_time=dataset.num_time,
+            max_seq_len=args.kt_max_seq_len, 
+            dim_emb_word=args.kt_dim_emb_word,
+            dim_emb_tuple=args.kt_dim_emb_tuple,
+            dim_emb_position=args.kt_dim_emb_position,
+            dim_emb_time=args.kt_dim_emb_time,
+            dim_emb_days=args.kt_dim_emb_days,
+            dim_emb_task=args.kt_dim_emb_task, 
+            dim_emb_user=args.kt_dim_emb_user,
+            num_exercise_encoder_layers=args.kt_num_exercise_encoder_layers, 
+            dim_attn_exercise=args.kt_dim_attn_exercise, 
+            num_attn_heads_exercise=args.kt_num_attn_heads_exercise,
+            num_interaction_encoder_layers=args.kt_num_interaction_encoder_layers,
+            dim_attn_interaction=args.kt_dim_attn_interaction,
+            num_attn_heads_interaction=args.kt_num_attn_heads_interaction, 
+            dim_ff_exercise=args.kt_dim_ff_exercise, 
+            dropout_exercise=args.kt_dropout_exercise, 
+            dim_ff_interaction=args.kt_dim_ff_interaction, 
+            dropout_interaction=args.kt_dropout_interaction, 
+            num_labels=args.kt_num_labels,
+            alpha=args.kt_memory_weight,
+            device=device,
+            ftr_comb='sum'
+        ).to(device)
+    elif model_name == 'DKT':
+        model = DKT(
+            input_size=args.dkt_input_size,
+            hidden_size=args.dkt_input_size,
+            num_layers=args.dkt_num_layers,
+            num_tuples=dataset.num_w_l_tuples,
+            output_size=dataset.num_words,
+            ceil=args.dkt_ceil
+        ).to(device)
 
 
     # if local_rank == 0:
@@ -118,6 +129,8 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
         loss_function = nn.CrossEntropyLoss(ignore_index=args.kt_pad_label_id)
     elif args.kt_loss == 'ce_focal':
         loss_function = CrossEntropyFocalLoss(ignore_index=args.kt_pad_label_id)
+    elif args.kt_loss == 'bce':
+        loss_function = torch.nn.BCEWithLogitsLoss(reduction='none')
 
     optimizer = AdamW(model.parameters(), lr=args.kt_learning_rate)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -174,100 +187,149 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             batch_seq_len = x_word_ids.size(1)
             batch_user_ascii = [ascii_decode(user_ascii) for user_ascii in x_user_ascii]
 
-            # check mask attn matrix
-            # attn_mask_list = x_w_l_tuple_attn_masks.numpy().tolist()
-            # label_seq = x_w_l_tuple_ids.numpy().tolist()
-            # for bid, seq in enumerate(label_seq):
-            #     print('batch_seq_len {}, valid_len {}, cur_len {}, pad_num {}'.format(batch_seq_len, x_valid_lengths[bid], len(seq), seq.count(0)))
-            #     print(seq)
-            #     print('-'*200)
-            # exit(1)
-            # for i, mask in enumerate(label_seq):
-            #     compressed = check_binary_matrix([mask])
-            #     print(x_valid_lengths[i], batch_seq_len-x_valid_lengths[i])
-            #     for j, row in enumerate(compressed):
-            #         print(j, row)
-            #     print('-'*200)
-            # exit(1)
-            # end check
-
-            # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
-            x_memory_update_matrix = (~(x_w_l_tuple_attn_masks.permute(0, 2, 1))).float()
-            
-            x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
-                batch_size * args.kt_num_attn_heads_interaction, 
-                batch_seq_len,
-                batch_seq_len, 
-            )
-            x_word_attn_masks = x_word_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_exercise, 1, 1).view(
-                batch_size * args.kt_num_attn_heads_exercise, 
-                batch_seq_len, 
-                batch_seq_len, 
-            )
-
 
             x_user_ids = x_user_ids.to(device)
             x_user_abilities = x_user_abilities.to(device)
             x_word_ids = x_word_ids.to(device)
-            x_word_attn_masks = x_word_attn_masks.to(device)
             x_w_l_tuple_ids = x_w_l_tuple_ids.to(device)
-            x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.to(device)
             x_position_ids = x_position_ids.to(device)
             x_task_ids = x_task_ids.to(device)
             x_interaction_ids = x_interaction_ids.to(device)
             y_labels = y_labels.to(device)
             split_ids = split_ids.to(device)
-            x_memory_update_matrix = x_memory_update_matrix.to(device)
-            
+                
             x_valid_lengths = x_valid_lengths.to(device)
             x_valid_interactions = x_valid_interactions.to(device)
-            # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
 
-            logits, memory_states = model(
-                x_word_ids=x_word_ids, 
-                x_word_attn_masks=x_word_attn_masks, 
-                x_w_l_tuple_ids=x_w_l_tuple_ids,
-                x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
-                x_position_ids=x_position_ids,
-                x_task_ids=x_task_ids,
-                x_days=x_days,
-                x_time=x_time,
-                x_user_ids=x_user_ids,
-                x_interaction_ids=x_interaction_ids,
-                x_memory_update_matrix=x_memory_update_matrix
-            )   # logits: [batch_size, seq_len] # memory_states: [batch_size, num_interactions]
+            if model_name == 'SAKT':
+                # check mask attn matrix
+                # attn_mask_list = x_w_l_tuple_attn_masks.numpy().tolist()
+                # label_seq = x_w_l_tuple_ids.numpy().tolist()
+                # for bid, seq in enumerate(label_seq):
+                #     print('batch_seq_len {}, valid_len {}, cur_len {}, pad_num {}'.format(batch_seq_len, x_valid_lengths[bid], len(seq), seq.count(0)))
+                #     print(seq)
+                #     print('-'*200)
+                # exit(1)
+                # for i, mask in enumerate(label_seq):
+                #     compressed = check_binary_matrix([mask])
+                #     print(x_valid_lengths[i], batch_seq_len-x_valid_lengths[i])
+                #     for j, row in enumerate(compressed):
+                #         print(j, row)
+                #     print('-'*200)
+                # exit(1)
+                # end check
 
-            logging.debug('logits shape: {}, memory shape: {}'.format(logits.shape, memory_states.shape))
+                # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
+                x_memory_update_matrix = (~(x_w_l_tuple_attn_masks.permute(0, 2, 1))).float()
+                x_memory_update_matrix = x_memory_update_matrix.to(device)
+                
+                x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
+                    batch_size * args.kt_num_attn_heads_interaction, 
+                    batch_seq_len,
+                    batch_seq_len, 
+                )
+                x_word_attn_masks = x_word_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_exercise, 1, 1).view(
+                    batch_size * args.kt_num_attn_heads_exercise, 
+                    batch_seq_len, 
+                    batch_seq_len, 
+                )
 
-            # optimize
-            logits_ = logits.view(batch_size*batch_seq_len, 2)
-            y_labels_ = y_labels.view(batch_size*batch_seq_len, )
-            split_ids_ = split_ids.view(batch_size*batch_seq_len, )
+                x_word_attn_masks = x_word_attn_masks.to(device)
+                x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.to(device)
 
-            y_labels_train = torch.where(split_ids_==1, y_labels_, -100) # train examples only
-            y_labels_dev = torch.where(split_ids_==2, y_labels_, -100) # dev examples only
-            y_labels_test = torch.where(split_ids_==3, y_labels_, -100) # test examples only
+                # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
 
-            valid_steps_train = torch.where(y_labels_train>=0, True, False).sum()
-            valid_steps_total = torch.where(y_labels_>=0, True, False).sum()
-            
-            # if valid_steps_train < args.kt_discard_rate * valid_steps_total:
-            #     logging.warning('-- Rank {}, in {}/{} epoch, {}/{} batch, user_ids {}, train_steps({})/total_steps({})<0.6({}), discard!'.format(
-            #         local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, valid_steps_train, valid_steps_total, valid_steps_train/valid_steps_total 
-            #     ))
-            #     continue 
+                logits, memory_states = model(
+                    x_word_ids=x_word_ids, 
+                    x_word_attn_masks=x_word_attn_masks, 
+                    x_w_l_tuple_ids=x_w_l_tuple_ids,
+                    x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
+                    x_position_ids=x_position_ids,
+                    x_task_ids=x_task_ids,
+                    x_days=x_days,
+                    x_time=x_time,
+                    x_user_ids=x_user_ids,
+                    x_interaction_ids=x_interaction_ids,
+                    x_memory_update_matrix=x_memory_update_matrix
+                )   # logits: [batch_size, seq_len] # memory_states: [batch_size, num_interactions]
 
-            loss = loss_function(logits_, y_labels_train.to(device))
-            epoch_loss += loss
+                logging.debug('logits shape: {}, memory shape: {}'.format(logits.shape, memory_states.shape))
 
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            
-            logging.info('Rank: {} In {}/{} epoch, {}/{} batch, batch_seq_len {}, valid_train_steps {}, total steps {}, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_seq_len, valid_steps_train, valid_steps_total, loss))
+                # optimize
+                logits_ = logits.view(batch_size*batch_seq_len, 2)
+                y_labels_ = y_labels.view(batch_size*batch_seq_len, )
+                split_ids_ = split_ids.view(batch_size*batch_seq_len, )
 
-            exit(1)
-            
+                y_labels_train = torch.where(split_ids_==1, y_labels_, -100) # train examples only
+                y_labels_dev = torch.where(split_ids_==2, y_labels_, -100) # dev examples only
+                y_labels_test = torch.where(split_ids_==3, y_labels_, -100) # test examples only
+
+                valid_steps_train = torch.where(y_labels_train>=0, True, False).sum()
+                valid_steps_total = torch.where(y_labels_>=0, True, False).sum()
+                
+                # if valid_steps_train < args.kt_discard_rate * valid_steps_total:
+                #     logging.warning('-- Rank {}, in {}/{} epoch, {}/{} batch, user_ids {}, train_steps({})/total_steps({})<0.6({}), discard!'.format(
+                #         local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_user_ids, valid_steps_train, valid_steps_total, valid_steps_train/valid_steps_total 
+                #     ))
+                #     continue 
+
+                loss = loss_function(logits_, y_labels_train.to(device))
+                epoch_loss += loss
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+                logging.info('Rank: {} In {}/{} epoch, {}/{} batch, batch_seq_len {}, valid_train_steps {}, total steps {}, train loss: {}'.format(local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, batch_seq_len, valid_steps_train, valid_steps_total, loss))
+
+                ## mastery probability
+                memory_states = torch.nn.functional.softmax(memory_states, -1)[:,:,:,0].view(batch_size, batch_seq_len, -1) # batch_size, batch_seq_len, num_words 
+
+            elif model_name == 'DKT':
+                logits = model(x_w_l_tuple_ids=x_w_l_tuple_ids) # [batch_size, seq_len, num_words]
+                ## mastery probability
+                # memory_states = 1 - torch.nn.functional.sigmoid(logits) # batch_size, batch_seq_len, num_words 
+                
+                # loss for predicting current Q
+                x_word_ids_indinces = x_word_ids.unsqueeze(-1)
+                logits_for_current = torch.gather(logits, -1, x_word_ids_indinces).squeeze(-1)
+
+                y_labels_train_current = torch.where(split_ids==1, y_labels, -100) # train examples only # [batch_size, seq_len]
+                train_weight_current = torch.where(y_labels_train_current>=0, 1, 0)  # mask [batch_size, seq_len]
+                loss_current = loss_function(input=logits_for_current, target=y_labels_train_current.to(device).float())
+                loss_current = (loss_current * train_weight_current).sum() / train_weight_current.sum() # filter pad tokens and get correct mean
+
+                # loss for predicting next Q
+                shifted_word_ids = torch.roll(x_word_ids, -1, dims=1)
+                logits_for_next = torch.gather(logits, -1, shifted_word_ids.unsqueeze(2)).squeeze(-1)
+                split_ids = torch.roll(split_ids, -1)
+                y_labels = torch.roll(y_labels, -1)
+                y_labels_train_next = torch.where(split_ids==1, y_labels, -100)
+                # y_labels_train_next[:, -1] = -100
+                train_weight_next = torch.where(y_labels_train_next>=0, 1, 0)
+                loss_next = loss_function(logits_for_next, y_labels_train_next.to(device).float())
+                loss_next = (loss_next * train_weight_next).sum() / train_weight_next.sum()
+                
+                # l1 and l2 norm of knowledge state
+                y_labels_train = torch.where(split_ids==1, y_labels, -100)
+                mask = torch.where(y_labels_train>=0, 1, 0) # [batch_size, seq_len]
+                probs = torch.sigmoid(logits) # [batch_size, seq_len, num_words]
+                shifted_probs = torch.roll(probs, 1, dims=1)
+
+                l1_reg = torch.sum(torch.abs(probs - shifted_probs) * mask.unsqueeze(2))
+                l2_reg = torch.sum(torch.square(probs - shifted_probs) * mask.unsqueeze(2))
+
+                loss = args.dkt_loss_next_weight * loss_next + args.dkt_loss_current_weight * loss_current + args.dkt_loss_l1_weight * l1_reg + args.dkt_loss_l2_weight * l2_reg
+
+                epoch_loss += loss
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+
+                logging.info('Rank {}, in {}/{} epoch, {}/{} batch, total_loss {}, next_prediction_loss {}, cur_prediction_loss {}, l1_reg: {}, l2_reg: {}.'.format(
+                    local_rank, epoch_id, args.kt_train_epoch, batch_id, batch_steps, loss, loss_next, loss_current, l1_reg, l2_reg
+                ))
+
+            else:
+                logging.error('unknown model_name {}'.format(model_name))
 
         
         model.eval()
@@ -277,60 +339,79 @@ def train_kt(args, local_rank, gpu_cnt, device, use_dev=False):
             batch_size = x_user_ids.size(0) # for last batch
             batch_seq_len = x_word_ids.size(1)
 
-            # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
-            x_memory_update_matrix = (~(x_w_l_tuple_attn_masks.permute(0, 2, 1))).float()
-            
-            x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
-                batch_size * args.kt_num_attn_heads_interaction, 
-                batch_seq_len,
-                batch_seq_len, 
-            )
-            x_word_attn_masks = x_word_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_exercise, 1, 1).view(
-                batch_size * args.kt_num_attn_heads_exercise, 
-                batch_seq_len, 
-                batch_seq_len, 
-            )
 
             x_user_ids = x_user_ids.to(device)
             x_user_abilities = x_user_abilities.to(device)
             x_word_ids = x_word_ids.to(device)
             x_word_attn_masks = x_word_attn_masks.to(device)
-            x_w_l_tuple_ids = x_w_l_tuple_ids.to(device)
-            x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.to(device)
             x_position_ids = x_position_ids.to(device)
             x_task_ids = x_task_ids.to(device)
             x_interaction_ids = x_interaction_ids.to(device)
             y_labels = y_labels.to(device)
             split_ids = split_ids.to(device)
-            x_memory_update_matrix = x_memory_update_matrix.to(device)
-            
             x_valid_lengths = x_valid_lengths.to(device)
             x_valid_interactions = x_valid_interactions.to(device)
-            # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
 
-            logits, memory_states = model(
-                x_word_ids=x_word_ids, 
-                x_word_attn_masks=x_word_attn_masks, 
-                x_w_l_tuple_ids=x_w_l_tuple_ids,
-                x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
-                x_position_ids=x_position_ids,
-                x_task_ids=x_task_ids,
-                x_days=x_days,
-                x_time=x_time,
-                x_user_ids=x_user_ids,
-                x_interaction_ids=x_interaction_ids,
-                x_memory_update_matrix=x_memory_update_matrix
-            )   # logits: [batch_size, seq_len] # memory_states: [batch_size, batch_seq_len, num_words, 2]
+            if model_name == 'SAKT':
+                # reshape attention mask to [num_attn_heads*batch_size, target_len, source_len, ]
+                x_memory_update_matrix = (~(x_w_l_tuple_attn_masks.permute(0, 2, 1))).float()
+                
+                x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_interaction, 1, 1).view(
+                    batch_size * args.kt_num_attn_heads_interaction, 
+                    batch_seq_len,
+                    batch_seq_len, 
+                )
+                x_word_attn_masks = x_word_attn_masks.unsqueeze(1).repeat(1, args.kt_num_attn_heads_exercise, 1, 1).view(
+                    batch_size * args.kt_num_attn_heads_exercise, 
+                    batch_seq_len, 
+                    batch_seq_len, 
+                )
 
-            ## mastery probability
-            memory_states = torch.nn.functional.softmax(memory_states, -1)[:,:,:,0].view(batch_size, batch_seq_len, -1) # batch_size, batch_seq_len, num_words 
+                x_w_l_tuple_ids = x_w_l_tuple_ids.to(device)
+                x_w_l_tuple_attn_masks = x_w_l_tuple_attn_masks.to(device)
 
+                x_memory_update_matrix = x_memory_update_matrix.to(device)
+            
+                # logging.info('-- rank {}, input shape {}'.format(local_rank, x_word_ids.shape))
+
+                logits, memory_states = model(
+                    x_word_ids=x_word_ids, 
+                    x_word_attn_masks=x_word_attn_masks, 
+                    x_w_l_tuple_ids=x_w_l_tuple_ids,
+                    x_w_l_tuple_attn_masks=x_w_l_tuple_attn_masks,
+                    x_position_ids=x_position_ids,
+                    x_task_ids=x_task_ids,
+                    x_days=x_days,
+                    x_time=x_time,
+                    x_user_ids=x_user_ids,
+                    x_interaction_ids=x_interaction_ids,
+                    x_memory_update_matrix=x_memory_update_matrix
+                )   # logits: [batch_size, seq_len, 2] # memory_states: [batch_size, batch_seq_len, num_words, 2]
+                
+                pos_probs = torch.nn.functional.softmax(logits, dim=-1)[:, :, 1] # batch_size, seq_len
+                memory_states = torch.nn.functional.softmax(memory_states, dim=-1)[:, :, :, 0]
+
+            elif model_name == 'DKT':
+            
+                logits = model(x_w_l_tuple_ids=x_w_l_tuple_ids) # [batch_size, seq_len, num_words]
+                
+                ## mastery probability
+                memory_states = 1 - torch.sigmoid(logits) # batch_size, batch_seq_len, num_words 
+
+                shifted_word_ids = torch.roll(x_word_ids, -1, dims=1)
+                logits = torch.gather(logits, -1, shifted_word_ids.unsqueeze(2)).squeeze(-1)
+                pos_probs = torch.nn.functional.sigmoid(logits)
+
+                split_ids = torch.roll(split_ids, -1, dims=-1)
+                y_labels = torch.roll(y_labels, -1, dims=1)
+                # y_labels[:, -1] = -100
+                
             if gpu_cnt <= 1:
                 for bid in range(batch_size):
                     kt_evaluator.add(
-                        user_id=x_user_ids[bid].cpu().numpy(), 
+                        user_id=x_user_ascii[bid].cpu().numpy(), 
                         user_ability=x_user_abilities[bid].cpu().numpy(), 
-                        logits=logits[bid].detach().cpu().numpy(), 
+                        pos_probs=pos_probs[bid].detach().cpu().numpy(), 
                         labels=y_labels[bid].cpu().numpy(), 
                         split_ids=split_ids[bid].cpu().numpy(), 
                         interaction_ids=x_interaction_ids[bid].cpu().numpy(), 
@@ -932,7 +1013,7 @@ if __name__ == '__main__':
     
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(message)s', 
-        # filename=args.kt_train_log, 
+        filename='train_kt.log',  # args.kt_train_log, 
         level=logging.INFO, 
         filemode='w'
     )

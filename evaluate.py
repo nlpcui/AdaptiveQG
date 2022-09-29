@@ -149,7 +149,7 @@ class KTEvaluator:
 
     def compute_metrics(self):
         # ROC and F1 score
-        # logits: [example_num, label_num(2)]
+        # pos_probs: [example_num, ]
         # labels: [example_num, ]
         
         total_examples = len(self.data)
@@ -161,9 +161,9 @@ class KTEvaluator:
         }
         
         collections = {
-            'train': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
-            'dev': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
-            'test': {'logits': [], 'labels': [], 'pred_labels': [], 'positive_probs': []},
+            'train': {'pos_probs': [], 'labels': [], 'pred_labels': [], 'pos_probs': []},
+            'dev': {'pos_probs': [], 'labels': [], 'pred_labels': [], 'pos_probs': []},
+            'test': {'pos_probs': [], 'labels': [], 'pred_labels': [], 'pos_probs': []},
         }
         pbar = tqdm(total=total_examples)
         for data in self.data:
@@ -173,15 +173,14 @@ class KTEvaluator:
                     logging.info('-- Single: user {} has no data for {} evaluation'.format(ascii_decode(data['user_id']), split))
                     continue # no such split data
                 
-                valid_logits = data['logits'][valid_positions] # flat
+                valid_pos_probs = data['pos_probs'][valid_positions] # flat
                 valid_labels = data['labels'][valid_positions] # flat
                 
-                pred_labels = np.argmax(valid_logits, axis=-1)
-                positive_probs = F.softmax(torch.tensor(valid_logits), dim=-1)[:,1].numpy()            
+                pred_labels = np.where(valid_pos_probs>0.5, 1, 0)         
 
                 collections[split]['pred_labels'].extend(pred_labels)
                 collections[split]['labels'].extend(valid_labels)
-                collections[split]['positive_probs'].extend(positive_probs)
+                collections[split]['pos_probs'].extend(valid_pos_probs)
             pbar.update(1)
         pbar.close()
         
@@ -190,22 +189,25 @@ class KTEvaluator:
         for split in ['train', 'dev', 'test']:
             collections[split]['pred_labels'] = np.array(collections[split]['pred_labels'])
             collections[split]['labels'] = np.array(collections[split]['labels'])
-            collections[split]['positive_probs'] = np.array(collections[split]['positive_probs'])
+            collections[split]['pos_probs'] = np.array(collections[split]['pos_probs'])
 
-            if len(collections[split]['pred_labels']) == 0 or len(collections[split]['labels']) == 0 or len(collections[split]['positive_probs']) == 0:
+            if len(collections[split]['pred_labels']) == 0 or len(collections[split]['labels']) == 0 or len(collections[split]['pos_probs']) == 0:
                 logging.warning('-- Total: no data for {} evaluation'.format(split))
                 continue
 
-            results[split]['roc'] = roc_auc_score(y_true=collections[split]['labels'], y_score=collections[split]['positive_probs'])
+            # print(collections[split]['labels'].shape, collections[split]['pos_probs'].shape)
+            # print(set(collections[split]['labels'].tolist()))
+            results[split]['roc'] = roc_auc_score(y_true=collections[split]['labels'], y_score=collections[split]['pos_probs'])
             results[split]['f1_score'] = f1_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
             results[split]['precision'] = precision_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
             results[split]['recall'] = recall_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
             results[split]['accuracy'] = accuracy_score(y_true=collections[split]['labels'], y_pred=collections[split]['pred_labels'])
 
+        # exit(1)
         return results
 
 
-    def add(self, user_id, user_ability, logits, labels, split_ids, interaction_ids, memory_states, valid_length, valid_interactions, direction):
+    def add(self, user_id, user_ability, pos_probs, labels, split_ids, interaction_ids, memory_states, valid_length, valid_interactions, direction):
         memory_points = []
         cur_iid = -1
         for idx in range(len(interaction_ids)):
@@ -215,18 +217,23 @@ class KTEvaluator:
 
         assert len(memory_points) == valid_interactions[0] + 1
 
+        # print(memory_states.shape)
 
         self.data.append({
-            'user_id': user_id,
+            'user_id': user_id, 
             'user_ability': user_ability,
-            'logits': logits[:valid_length[0]] if direction=='right' else logits[-valid_length[0]:],
+            'pos_probs': pos_probs[:valid_length[0]] if direction=='right' else pos_probs[-valid_length[0]:],
             'labels': labels[:valid_length[0]] if direction=='right' else labels[-valid_length[0]:],
             'split_ids': split_ids[:valid_length[0]] if direction=='right' else split_ids[-valid_length[0]:],
             'interaction_ids': interaction_ids[:valid_length[0]] if direction=='right' else interaction_ids[-valid_length[0]:],
             'memory_states': memory_states[memory_points], # [interaction_num+1, num_words]
             'mastery_level': np.mean(memory_states, axis=-1) # [interaction_num+1, ]
         })
+
+        # for key in self.data[-1]:
+        #     print(key, self.data[-1][key].shape)
         
+        # exit(1)
 
 
     def save_result(self, dirname):

@@ -99,9 +99,9 @@ class TransformerEncodingBlock(nn.Module):
         return ff_output, attn_output_weights
 
 
-class KnowledgeTracer(nn.Module):
+class SAKT(nn.Module):
     def __init__(self, num_words, num_w_l_tuples, num_tasks, num_time, num_days, num_users, max_seq_len, dim_emb_word, dim_emb_tuple, dim_emb_task, dim_emb_position, dim_emb_time, dim_emb_days, dim_emb_user, num_exercise_encoder_layers, dim_attn_exercise, num_attn_heads_exercise, dim_ff_exercise, dropout_exercise, num_interaction_encoder_layers, dim_attn_interaction, num_attn_heads_interaction, dim_ff_interaction, dropout_interaction, ftr_comb='sum', device='cpu', num_labels=2, alpha=0.8, emb_padding_idx=0):
-        super(KnowledgeTracer, self).__init__()
+        super(SAKT, self).__init__()
         
         self.alpha = alpha
         self.device = device
@@ -213,6 +213,21 @@ class KnowledgeTracer(nn.Module):
         # print('logits has nan? {}'.format(torch.isnan(logits).any()))
         # exit(1)
         return logits, memory_states_acc
+
+
+class DKT(nn.Module):
+    def __init__(self, input_size, num_layers, hidden_size, num_tuples, output_size, ceil='LSTM'):
+        super(DKT, self).__init__()
+        self.rnn = torch.nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, bias=True, batch_first=True)
+        self.tuple_embeddings = nn.Embedding(num_tuples, input_size)
+        self.ffn = torch.nn.Linear(hidden_size, output_size)
+
+    def forward(self, x_w_l_tuple_ids):
+        tuple_embeddings = self.tuple_embeddings(x_w_l_tuple_ids)
+        states, (h_n, c_n) = self.rnn(tuple_embeddings) # states:[batch_size, seq_len, hidden_size]
+        logits = self.ffn(states)
+
+        return logits
 
 
 
