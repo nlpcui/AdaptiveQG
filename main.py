@@ -48,7 +48,7 @@ def train_kt(args, local_rank, gpu_cnt, device, model_name='DKT', use_dev=False)
         max_seq_len=args.kt_max_seq_len,
         label_pad_id=int(args.kt_pad_label_id),
         target_split=['train', 'dev', 'test'],
-        max_lines=-1,
+        max_lines=1000,
         discard_rate=args.kt_discard_rate
     )
     logging.info('-- local_rank: {}, finished building dataset, {} data in total.'.format(local_rank, len(dataset)))
@@ -130,7 +130,7 @@ def train_kt(args, local_rank, gpu_cnt, device, model_name='DKT', use_dev=False)
     elif args.kt_loss == 'ce_focal':
         loss_function = CrossEntropyFocalLoss(ignore_index=args.kt_pad_label_id)
     elif args.kt_loss == 'bce':
-        loss_function = torch.nn.BCEWithLogitsLoss(reduction='none')
+        loss_function = torch.nn.BCEWithLogitsLoss(reduction='none',)
 
     optimizer = AdamW(model.parameters(), lr=args.kt_learning_rate)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -286,14 +286,16 @@ def train_kt(args, local_rank, gpu_cnt, device, model_name='DKT', use_dev=False)
             elif model_name == 'DKT':
                 logits = model(x_w_l_tuple_ids=x_w_l_tuple_ids) # [batch_size, seq_len, num_words]
                 ## mastery probability
-                # memory_states = 1 - torch.nn.functional.sigmoid(logits) # batch_size, batch_seq_len, num_words 
                 
                 # loss for predicting current Q
                 x_word_ids_indinces = x_word_ids.unsqueeze(-1)
                 logits_for_current = torch.gather(logits, -1, x_word_ids_indinces).squeeze(-1)
-
                 y_labels_train_current = torch.where(split_ids==1, y_labels, -100) # train examples only # [batch_size, seq_len]
-                train_weight_current = torch.where(y_labels_train_current>=0, 1, 0)  # mask [batch_size, seq_len]
+                
+                train_weight_current = torch.where(y_labels_train_current==1, args.kt_pos_weight, y_labels_train_current) # positive examples, weight=pos_weight
+                train_weight_current = torch.where(y_labels_train_current==0, 1, train_weight_current) # negative exampels, weight = 1
+                train_weight_current = torch.where(y_labels_train_current==-100, 0, train_weight_current) # pad positions, weight = 0
+
                 loss_current = loss_function(input=logits_for_current, target=y_labels_train_current.to(device).float())
                 loss_current = (loss_current * train_weight_current).sum() / train_weight_current.sum() # filter pad tokens and get correct mean
 
@@ -303,19 +305,22 @@ def train_kt(args, local_rank, gpu_cnt, device, model_name='DKT', use_dev=False)
                 split_ids = torch.roll(split_ids, -1)
                 y_labels = torch.roll(y_labels, -1)
                 y_labels_train_next = torch.where(split_ids==1, y_labels, -100)
-                # y_labels_train_next[:, -1] = -100
-                train_weight_next = torch.where(y_labels_train_next>=0, 1, 0)
+            
+                train_weight_next = torch.where(y_labels_train_next==1, args.kt_pos_weight, y_labels_train_next) # positive examples, weight=pos_weight
+                train_weight_next = torch.where(y_labels_train_next==0, 1, train_weight_next) # negative exampels, weight = 1
+                train_weight_next = torch.where(y_labels_train_next==-100, 0, train_weight_next) # pad positions, weight = 0
+                
                 loss_next = loss_function(logits_for_next, y_labels_train_next.to(device).float())
                 loss_next = (loss_next * train_weight_next).sum() / train_weight_next.sum()
                 
                 # l1 and l2 norm of knowledge state
                 y_labels_train = torch.where(split_ids==1, y_labels, -100)
-                mask = torch.where(y_labels_train>=0, 1, 0) # [batch_size, seq_len]
+                mask = torch.where(y_labels_train>=0, 1, 0).unsqueeze(2) # [batch_size, seq_len, 1]
                 probs = torch.sigmoid(logits) # [batch_size, seq_len, num_words]
-                shifted_probs = torch.roll(probs, 1, dims=1)
+                shifted_probs = torch.roll(probs, 1, dims=1) # state of the last step
 
-                l1_reg = torch.sum(torch.abs(probs - shifted_probs) * mask.unsqueeze(2))
-                l2_reg = torch.sum(torch.square(probs - shifted_probs) * mask.unsqueeze(2))
+                l1_reg = torch.sum(torch.abs(probs - shifted_probs) * mask) / mask.sum() # 
+                l2_reg = torch.sum(torch.square(probs - shifted_probs) * mask) / mask.sum() # 
 
                 loss = args.dkt_loss_next_weight * loss_next + args.dkt_loss_current_weight * loss_current + args.dkt_loss_l1_weight * l1_reg + args.dkt_loss_l2_weight * l2_reg
 
@@ -400,7 +405,7 @@ def train_kt(args, local_rank, gpu_cnt, device, model_name='DKT', use_dev=False)
 
                 shifted_word_ids = torch.roll(x_word_ids, -1, dims=1)
                 logits = torch.gather(logits, -1, shifted_word_ids.unsqueeze(2)).squeeze(-1)
-                pos_probs = torch.nn.functional.sigmoid(logits)
+                pos_probs = torch.sigmoid(logits)
 
                 split_ids = torch.roll(split_ids, -1, dims=-1)
                 y_labels = torch.roll(y_labels, -1, dims=1)
@@ -922,7 +927,7 @@ def train_non_adaptive_baselines(args, gpu_cnt, local_rank, device, enable_diffi
                     batch_difficulty_levels = [torch.zeros_like(x_difficulty_levels).to(device) for i in range(gpu_cnt)]
                     batch_prompt_words = [torch.zeros_like(x_prompt_word_ids).to(device) for i in range(gpu_cnt)]
                     batch_reference = [torch.zeros_like(y_exercise_labels).to(device) for i in range(gpu_cnt)]
-                    batch_generated = [torch.zeros_like(output_ids).to(device) for i in range(gpu_cnt)]
+                    batch_generated = [torch.zeros_like(output_ids).to(device) for i in range(gpu_cnt)] 
                     
                     dist.all_gather(batch_difficulty_scores, x_difficulty_scores.to(device))
                     dist.all_gather(batch_difficulty_levels, x_difficulty_levels.to(device))
