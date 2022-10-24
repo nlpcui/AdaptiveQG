@@ -1,9 +1,9 @@
 import torch, math, transformers, logging
 import torch.nn as nn
 import torch.nn.functional as F
-# from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
 from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, AutoConfig, BartTokenizer
 import numpy as np
+import pandas as pd
 
 
 
@@ -230,11 +230,24 @@ class DKT(nn.Module):
         return logits
 
 
+class ReWeightBlock(nn.Module):
+    def __init__(self, dim_input, dim_hidden, dim_output):
+        self.ff1 = nn.Linear(dim_input, dim_hidden, bias=True)
+        self.ff2 = nn.Linear(dim_hidden, dim_output, bias=True)
+        
+    def forward(self, x):
+        return x + self.ff2(torch.relu(self.ff1(x))) 
+
 
 class AdaptiveQuestionGenerator(nn.Module):
-    def __init__(self, model_name):
+    def __init__(self, model_name, vocab_size, temperature):
         super(QuestionGenerator, self).__init__()
-        self.generator = AutoModelForSeq2SeqLM.from_pretrained(model_name, output_attentions=True)
+        self.base_generator = BartForConditionalGeneration.from_pretrained(model_name, output_attentions=True)
+        self.temperature = temperature
+        self.vocab_size = vocab_size
+        self.reweighter = torch.nn.ModuleList([
+            ReWeightBlock(vocab_size*3, vocab_size*3, vocab_size)
+        ])
         
 
     def forward(self, x_keyword_ids, x_attention_mask, x_knowledge_state, y_difficulties, y_exercise_ids, decoder_input_ids):
@@ -247,45 +260,208 @@ class AdaptiveQuestionGenerator(nn.Module):
         decoder_input_ids: [batch_size, y_max_length]
         
         '''
-        outputs = self.generator(
+        outputs = self.base_generator(
             input_ids=x_keyword_ids, 
             attention_mask=x_attention_mask, 
             decoder_input_ids=decoder_input_ids,
             labels=y_exercise_ids
-        )
+        ) 
+        # batch_size, seq_len, vocab_size
+        previous_generations = torch.softmax(outputs.logits/self.temperature)
 
+        outputs.logits
         return outputs
 
 
-class AQG(nn.Module):
-    def __init__(self):
-        pass
+class Hypothesis:
+    def __init__(self, decoded_ids, likelihood=0, difficulty=0):
+        self.decoded_ids = decoded_ids
+        self.likelihood = likelihood
+        self.difficulty = difficulty
+        self.final_score = 0
 
-    def forward(self):
-        pass
+    def extends(self, probs, difficulties):
+        extensions = []
+        for i in range(len(probs)):
+            extensions.append(Hypothesis(
+                decoded_ids=self.decoded_ids + [i],
+                likelihood=self.likelihood + math.log(probs[i]),
+                difficulty=self.difficulty + difficulties[i]
+            ))
+        
+        return extensions
 
+    def compute_score(self, factor, target_value):
+        self.final_score = self.likelihood / len(self.decoded_ids) + factor * abs(target_value-self.difficulty)
+
+
+class SubWordItem:
+    def __init__(self, subword_id, subword_match, subword_type, subword_value):
+        self.subword_id = subword_id
+        self.subword_match = subword_match # list
+        self.subword_type = subword_type # n: not in vocab; b: subword_start; i: subword_inside, o: complete word  
+        self.subword_value = subword_value # 0 for special_tokens, -99999 for oo_source 
+
+
+class BeamSearchWithDynamicGrouping:
+    def __init__(self, model, beam_size, temperature, score_bucket, source_vocab, tokenizer, max_steps):
+        self.beam_size = beam_size
+        self.temperature = temperature
+        self.vocab_size = len(tokenizer)
+        self.score_bucket = score_bucket
+        self.tokenizer = tokenizer
+        self.model = model
+        self.special_token_ids = [tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.unk_token_id, tokenizer.pad_token_id]
+        self.max_steps = max_steps
+
+        self.source_vocab = source_vocab
+        self.target_vocab = {i: SubWordItem(i, [], None, -99999) for i in range(len(self.tokenizer))}
+        
+        self.map_vocab()
+
+
+    def generate(self, input_ids, attention_mask, probs, target_value, vocab_value, num_return):
+        '''
+        logits: seq_len, vocab_size
+        '''
+        # set value of self.target_vocab
+        self.__set_value(vocab_value)
+
+        num_groups = int(target_value//bucket+1) 
+        hypo_groups = [[Hypothesis(tokenizer.bos_token_id)]]
+        
+        qualified_hypotheses = []
+
+        past_key_values = None
+        is_finish = False
+        step = 0
+
+        while not is_finish:
+            extensions = []
+            for group in hypo_groups:
+                for hypo in group:
+                    last_word_id = hpyo.decoded_ids[:, [-1], :]
+                    output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True, past_key_values=past_key_values, decoder_input_ids=last_word_id)
+                    last_logits = output.logits[:, [-1], :] # [batch_size, 1, vocab_size]
+                    last_probs = torch.softmax(last_logits / self.temperature)
+                    extensions.extend(hypo.extends(last_probs, vocab_score))
+
+            hypo_groups = self.regroup(extensions)
+            group_size = self.allocate_group_size(hypo_groups)
+            self.ingroup_rank(hypo_groups, group_size)
+            
+            step += 1
+            # finish criteria
+            if step >= self.max_steps:
+                is_finish = True
+            elif has_qualified_results(result_collections):
+                is_finish = True
+
+        # final selection
+        for hypo in qualified_hypotheses:
+            hypo.compute_score(self.match_factor, target_value)
+        qualified_hypotheses.sort(key=lambda x:x.final_score)
+        
+        return qualified_hypotheses[: num_return]
+
+
+    def regroup(self, num_groups):
+        # regroup
+        # 1.regroup extensions to groups; 2.adjust group size; 3.in-group sorting, 
+        extensions = []
+        groups = [[] i for i in range(num_groups)]
+        for hypo in extensions:
+            pass
+
+
+    def allocate_group_size(self, hypo_groups):
+        pass
+        return group_size
+
+
+    def ingroup_rank(self, hypo_groups, group_size):
+        pass
+        return completions
+
+
+    def map_vocab(self):
+        # map source vocab (skills) to target vocab (tokenizer vocab)
+        '''
+        special_tokens, map=[]
+        oov_tokens, map=[]
+        match_tokens, map=[skill_ids]
+        '''
+        
+        match_words = {}
+        unmatch_words = {word: 0 for word in self.source_vocab}
+        # print(unmatch_words)
+
+        # complete word match
+        for subword_id in range(len(self.tokenizer)):
+            if subword_id in self.special_token_ids:
+                continue # special_tokens, map=[]
+            else:
+                subword = self.tokenizer.decode(subword_id).strip().lower()
+                if subword in self.source_vocab: # matched complete word
+                    self.target_vocab[subword_id].subword_match.append(subword)
+                    self.target_vocab[subword_id].subword_type = 'n'
+                    match_words[subword] = self.source_vocab[subword]
+                    if subword in unmatch_words:
+                        unmatch_words.pop(subword)
+                else: # not matched word
+                    pass # TODO: handle subword
+
+        # subword match
+        for original_word in unmatch_words:
+            word_formats = [original_word, original_word.capitalize(), ' '+original_word, ' '+original_word.capitalize()]
+            for word in word_formats:
+                subword_ids = self.tokenizer(word, add_special_tokens=False)['input_ids']
+                for subword_id in subword_ids:
+                    # if self.tokenizer.decode(subword_id) in match_words:
+                    #     print('subword is also full word', self.tokenizer.decode(subword_id))
+                    if word.startswith(' ') or word[0].isupper():
+                        self.target_vocab[subword_id].subword_type = 'b'
+                    else:
+                        self.target_vocab[subword_id].subword_type = 'i'
+                    if original_word not in self.target_vocab[subword_id].subword_match:
+                        self.target_vocab[subword_id].subword_match.append(original_word)
+
+
+        # for word_id in self.target_vocab:
+        #     if len(self.target_vocab[word_id]) > 1:
+        #         print('"{}"'.format(word_id), '"{}"'.format(self.tokenizer.decode(word_id)), self.target_vocab[word_id])
+        
+        # exit(1)
+        # cnt = 0
+        # mcnt = 0
+        # for word in self.target_vocab:
+        #     if len(self.target_vocab[word]) > 0:
+        #         cnt += 1
+        #     if len(self.target_vocab[word]) > 1:
+        #         mcnt += 1
+        # print(cnt, mcnt)
+        # exit(1)
+        return match_words, unmatch_words
+
+    def assign_values(self, source_vocab_value):
+        for word_id in self.target_vocab:
+            avg_value = 0
+            for match in self.target_vocab[word_id].subword_match:
+                avg_value += source_vocab_value[match]
+            avg_value /= len(self.target_vocab[word_id].subword_match)
+
+            self.target_vocab[word_id].value = avg_value
 
 '''
 baselines
 '''
 
 
-class NonAdaptiveQuestionGenerator(nn.Module):
-    def __init__(self, model_name, num_difficulty_levels, num_embeddings, enable_difficulty):
-        # model options: T5, Bart, 
-        config = AutoConfig.from_pretrained(model_name)
-        self.generator = AutoModelForSeq2SeqLM.from_config(model_name)
-
-
-    def forward(self):
+if __name__ == '__main__':
+    bart_tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
+    df = pd.read_csv('/Users/cuipeng/Documents/Datasets/duolingo_2018_shared_task/data_en_es/words.csv')
+    vocabulary = {}
+    for _, row in df.iterrows():
+        vocabulary[row['word']] = row['error_rate']
         
-        pass
-
-
-## Bart
-
-
-## T5
-
-
-## GPT2
+    generator = BeamSearchWithDynamicGrouping(model=None, beam_size=5, temperature=1, score_bucket=0.2, source_vocab=vocabulary,  tokenizer=bart_tokenizer, max_steps=50)
